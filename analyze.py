@@ -53,6 +53,7 @@ Flow summary:
 
 from typing import Dict, Any
 import threading
+import re
 
 from gpt_client import (
     score_tweet_importance,
@@ -89,13 +90,46 @@ def _fallback(tweet_id: str, reason: str) -> Dict[str, Any]:
 # Load existing headline state from disk (full + compressed).
 load_headline_state()
 
+
+
+def _core_story_key_from_text(text: str) -> str:
+    """
+    Build a coarse story key directly from raw tweet text to catch
+    same-story posts that use different wording or account-specific prefixes.
+    """
+    if not text:
+        return ""
+
+    cleaned = (text or "").upper()
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    cleaned = re.sub(r"[@#]([A-Z0-9_]+)", r"\1", cleaned)
+    cleaned = re.sub(r"\$([A-Z][A-Z0-9]{1,9})", r"\1", cleaned)
+    cleaned = re.sub(r"[^A-Z0-9\s]", " ", cleaned)
+
+    tokens = re.findall(r"[A-Z0-9]+", cleaned)
+    if not tokens:
+        return ""
+
+    stop = {
+        "BREAKING", "JUST", "IN", "SOURCE", "SOURCES", "REPORT", "REPORTS",
+        "SAYS", "SAY", "RUMOR", "RUMORS", "THREAD", "UPDATE", "NEWS",
+        "THE", "A", "AN", "TO", "FOR", "OF", "AND", "ON", "AT", "BY",
+        "WITH", "FROM", "IS", "ARE", "WAS", "WERE", "AS", "THAT", "THIS",
+    }
+    filtered = [t for t in tokens if t not in stop]
+    if not filtered:
+        filtered = tokens
+
+    # Keep the early semantic spine (order matters) while avoiding very long keys.
+    return " ".join(filtered[:18])
+
 # In-memory story-level dedupe (per process/run).
 # Uses normalized fallback headline keys to claim "this story slot".
 _STORY_KEYS: set[str] = set()
 _STORY_LOCK = threading.Lock()
 
 
-def _claim_story_slot_from_fallback(headline: str) -> bool:
+def _claim_story_slot_from_fallback(headline: str, raw_text: str = "") -> bool:
     """
     Try to claim a story slot based on the LOCAL fallback headline.
 
@@ -111,15 +145,20 @@ def _claim_story_slot_from_fallback(headline: str) -> bool:
       - Only applies in-memory; disk-based dedupe is handled separately.
     """
     key = normalize_headline_for_key(headline)
-    if not key:
+    raw_key = _core_story_key_from_text(raw_text)
+
+    if not key and not raw_key:
         # If something goes wrong with normalization, fail open and
         # allow the story through rather than killing analysis.
         return True
 
     with _STORY_LOCK:
-        if key in _STORY_KEYS:
+        if (key and key in _STORY_KEYS) or (raw_key and raw_key in _STORY_KEYS):
             return False
-        _STORY_KEYS.add(key)
+        if key:
+            _STORY_KEYS.add(key)
+        if raw_key:
+            _STORY_KEYS.add(raw_key)
         return True
 
 
@@ -169,7 +208,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # Only the first thread to claim this fallback headline key will
     # proceed to GPT. Others will bail out to save tokens.
     try:
-        claimed = _claim_story_slot_from_fallback(candidate_pre)
+        claimed = _claim_story_slot_from_fallback(candidate_pre, text)
     except Exception as e:
         print(f"[DEDUP-WARN] _claim_story_slot_from_fallback failed for {tweet_id_str}: {e!r}")
         claimed = True  # fail open
