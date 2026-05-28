@@ -1,0 +1,7 @@
+# Environment files
+.env.txt
+.env*
+*.env
+.env.txt
+backup/
+
