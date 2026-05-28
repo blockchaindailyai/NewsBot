@@ -3,6 +3,8 @@ import sys
 import time
 import threading
 import subprocess
+import logging
+from dataclasses import dataclass, field
 from queue import Queue, Empty
 
 from selenium.common.exceptions import (
@@ -33,23 +35,29 @@ from storage import (
     append_seen_id,
     append_tweet_log,
 )
+from config import (
+    DEBUG_QUEUE_LOGS,
+    RETRY_CHECK_INTERVAL,
+    SCRAPE_BACKOFF_SHORT_SECONDS,
+    SCRAPE_BACKOFF_LONG_SECONDS,
+    SCRAPE_FAILURE_THRESHOLD,
+    LOOP_SLEEP_SECONDS,
+)
 
-# ---------------- CONFIG: VERBOSITY / BEHAVIOR ---------------- #
+logger = logging.getLogger("orchestrator")
 
-DEBUG_QUEUE_LOGS = False
-RETRY_CHECK_INTERVAL = 60.0
 
-# --------------------------------------------------------------- #
+@dataclass
+class BotRuntime:
+    should_exit: bool = False
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
-SHOULD_EXIT = False
-STOP_EVENT = threading.Event()
 
-_print_lock = threading.Lock()
+runtime = BotRuntime()
 
 
 def safe_print(*args, **kwargs):
-    with _print_lock:
-        print(*args, **kwargs)
+    logger.info(" ".join(str(a) for a in args))
 
 
 def _kill_chrome_tree():
@@ -121,14 +129,13 @@ def input_listener():
     Listens on stdin for 'q/quit/exit/stop' and sets SHOULD_EXIT/STOP_EVENT so
     the main loop and poster thread can exit cleanly.
     """
-    global SHOULD_EXIT
     safe_print("[COMMAND] Type 'q', 'quit', 'exit', or 'stop' then Enter to shut down gracefully.\n")
     for line in sys.stdin:
         cmd = line.strip().lower()
         if cmd in {"q", "quit", "exit", "stop"}:
             safe_print("[COMMAND] Shutdown command received. Exiting after current cycle.")
-            SHOULD_EXIT = True
-            STOP_EVENT.set()
+            runtime.should_exit = True
+            runtime.stop_event.set()
             break
 
 
@@ -215,7 +222,7 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
 
     while True:
         # Global shutdown: stop once requested AND there is no more work.
-        if STOP_EVENT.is_set() and post_queue.empty() and not retry_queue:
+        if runtime.stop_event.is_set() and post_queue.empty() and not retry_queue:
             break
 
         now = time.time()
@@ -280,7 +287,7 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
                 safe_print("[POST] Compose backoff active; requeueing item without posting.")
             post_queue.put(item)
             post_queue.task_done()
-            time.sleep(5)
+            time.sleep(SCRAPE_BACKOFF_SHORT_SECONDS)
             continue
 
         post_result = None
@@ -375,9 +382,8 @@ def run_bot():
           * Print full info in a single atomic block.
           * If headline, enqueue for post_sender.
     """
-    global SHOULD_EXIT
-    SHOULD_EXIT = False
-    STOP_EVENT.clear()
+    runtime.should_exit = False
+    runtime.stop_event.clear()
 
     scraper_driver, poster_driver = ensure_both_profiles_ready()
 
@@ -404,7 +410,7 @@ def run_bot():
     consecutive_scrape_failures = 0
 
     try:
-        while not SHOULD_EXIT:
+        while not runtime.should_exit:
             safe_print("[LOOP] Scraping home timeline...")
 
             try:
@@ -412,12 +418,12 @@ def run_bot():
             except (InvalidSessionIdException, WebDriverException, ReadTimeoutError, TimeoutException) as e:
                 safe_print(f"[WARN] Scraper driver error ({e.__class__.__name__}); will back off briefly: {e!r}")
                 consecutive_scrape_failures += 1
-                if consecutive_scrape_failures >= 5:
+                if consecutive_scrape_failures >= SCRAPE_FAILURE_THRESHOLD:
                     safe_print("[BACKOFF] Too many scrape failures; sleeping 60 seconds.")
-                    time.sleep(60)
+                    time.sleep(SCRAPE_BACKOFF_LONG_SECONDS)
                     consecutive_scrape_failures = 0
                 else:
-                    time.sleep(5)
+                    time.sleep(SCRAPE_BACKOFF_SHORT_SECONDS)
                 continue
             except Exception as e:
                 safe_print(f"[ERROR] Unexpected scrape error: {e!r}")
@@ -459,15 +465,15 @@ def run_bot():
             except Exception as e:
                 safe_print(f"[WARN] Failed to save signal stats: {e!r}")
 
-            for _ in range(20):
-                if SHOULD_EXIT:
+            for _ in range(LOOP_SLEEP_SECONDS):
+                if runtime.should_exit:
                     break
                 time.sleep(1)
 
         safe_print("[EXIT] Shutdown flag set. Stopping scraper loop.")
 
     finally:
-        STOP_EVENT.set()
+        runtime.stop_event.set()
 
         try:
             safe_print("[EXIT] Waiting for post_queue to drain...")

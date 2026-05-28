@@ -4,40 +4,27 @@
 import os
 import time
 import undetected_chromedriver as uc
+from selenium.common.exceptions import SessionNotCreatedException
 
+from config import (
+    SCRAPER_HEADLESS,
+    POSTER_HEADLESS,
+    SCRAPER_WINDOW_SIZE,
+    SCRAPER_WINDOW_POS,
+    POSTER_WINDOW_SIZE,
+    POSTER_WINDOW_POS,
+    FORCE_CHROME_MAJOR,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# =======================
-# Window / mode settings
-# =======================
-# NOTE: Your comments and values were mismatched in the file you pasted.
-# Set these how you actually want them to run:
-SCRAPER_HEADLESS = False              # True -> headless(old) once cookies exist; False -> always visible
-POSTER_HEADLESS  = False              # poster SHOULD generally be visible for trusted input events
+# Runtime settings are loaded from config.py / environment variables.
 
-# Scraper window (headless still uses metrics)
-SCRAPER_WINDOW_SIZE = "1400,950"
-SCRAPER_WINDOW_POS  = "0,0"
-
-# Poster window off-screen: keep it visible but outside any monitor bounds.
-# On Windows with a 1920x1080 primary, -3000,0 is safely off-screen.
-POSTER_WINDOW_SIZE = "1280,900"
-POSTER_WINDOW_POS  = "0,0"        # change to "0,0" if you want it on-screen for debugging
-
-PROFILE_DIR_SCRAPER = os.path.join(os.getcwd(), "x_profile")
-PROFILE_DIR_POSTER  = os.path.join(os.getcwd(), "x_poster_profile")
-
-# =======================
-# Chrome channel control
-# =======================
 CHROME_BETA_BIN   = r"C:\Program Files\Google\Chrome Beta\Application\chrome.exe"
 CHROME_STABLE_BIN = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-
-# If you're forcing Beta 145, keep this at 145.
-# If you want UC to auto-detect, set to None (but then mismatches can happen after updates).
-FORCE_CHROME_MAJOR = 145  # set to 144 if staying on stable 144; or None to auto
+PROFILE_DIR_SCRAPER = os.path.join(os.getcwd(), "x_profile")
+PROFILE_DIR_POSTER  = os.path.join(os.getcwd(), "x_poster_profile")
 
 
 def _pick_chrome_binary() -> str:
@@ -86,11 +73,20 @@ def _make_options(user_data_dir: str, headless: bool, size: str, pos: str) -> uc
 def _make_driver(user_data_dir: str, headless: bool, size: str, pos: str) -> uc.Chrome:
     opts = _make_options(user_data_dir, headless, size, pos)
 
-    # ✅ Force UC to fetch a matching major-version chromedriver (prevents 145 driver vs 144 chrome)
+    # If a forced major is configured, try it first; if it mismatches installed Chrome,
+    # automatically fall back to UC auto-detection to avoid restart loops.
     if FORCE_CHROME_MAJOR is None:
         driver = uc.Chrome(options=opts)
     else:
-        driver = uc.Chrome(options=opts, version_main=int(FORCE_CHROME_MAJOR))
+        try:
+            driver = uc.Chrome(options=opts, version_main=int(FORCE_CHROME_MAJOR))
+        except SessionNotCreatedException as e:
+            msg = str(e)
+            if "only supports Chrome version" in msg or "Current browser version is" in msg:
+                print(f"[AUTH-WARN] Forced Chrome major {FORCE_CHROME_MAJOR} mismatched installed browser; retrying with auto-detect.")
+                driver = uc.Chrome(options=opts)
+            else:
+                raise
 
     # Ensure device metrics and bring-to-front semantics even in headless
     try:
