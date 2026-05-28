@@ -4,6 +4,7 @@
 import os
 import time
 import undetected_chromedriver as uc
+from selenium.common.exceptions import SessionNotCreatedException
 
 from config import (
     SCRAPER_HEADLESS,
@@ -72,11 +73,20 @@ def _make_options(user_data_dir: str, headless: bool, size: str, pos: str) -> uc
 def _make_driver(user_data_dir: str, headless: bool, size: str, pos: str) -> uc.Chrome:
     opts = _make_options(user_data_dir, headless, size, pos)
 
-    # ✅ Force UC to fetch a matching major-version chromedriver (prevents 145 driver vs 144 chrome)
+    # If a forced major is configured, try it first; if it mismatches installed Chrome,
+    # automatically fall back to UC auto-detection to avoid restart loops.
     if FORCE_CHROME_MAJOR is None:
         driver = uc.Chrome(options=opts)
     else:
-        driver = uc.Chrome(options=opts, version_main=int(FORCE_CHROME_MAJOR))
+        try:
+            driver = uc.Chrome(options=opts, version_main=int(FORCE_CHROME_MAJOR))
+        except SessionNotCreatedException as e:
+            msg = str(e)
+            if "only supports Chrome version" in msg or "Current browser version is" in msg:
+                print(f"[AUTH-WARN] Forced Chrome major {FORCE_CHROME_MAJOR} mismatched installed browser; retrying with auto-detect.")
+                driver = uc.Chrome(options=opts)
+            else:
+                raise
 
     # Ensure device metrics and bring-to-front semantics even in headless
     try:
