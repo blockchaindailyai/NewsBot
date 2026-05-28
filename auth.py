@@ -5,39 +5,25 @@ import os
 import time
 import undetected_chromedriver as uc
 
+from config import (
+    SCRAPER_HEADLESS,
+    POSTER_HEADLESS,
+    SCRAPER_WINDOW_SIZE,
+    SCRAPER_WINDOW_POS,
+    POSTER_WINDOW_SIZE,
+    POSTER_WINDOW_POS,
+    FORCE_CHROME_MAJOR,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# =======================
-# Window / mode settings
-# =======================
-# NOTE: Your comments and values were mismatched in the file you pasted.
-# Set these how you actually want them to run:
-SCRAPER_HEADLESS = False              # True -> headless(old) once cookies exist; False -> always visible
-POSTER_HEADLESS  = False              # poster SHOULD generally be visible for trusted input events
+# Runtime settings are loaded from config.py / environment variables.
 
-# Scraper window (headless still uses metrics)
-SCRAPER_WINDOW_SIZE = "1400,950"
-SCRAPER_WINDOW_POS  = "0,0"
-
-# Poster window off-screen: keep it visible but outside any monitor bounds.
-# On Windows with a 1920x1080 primary, -3000,0 is safely off-screen.
-POSTER_WINDOW_SIZE = "1280,900"
-POSTER_WINDOW_POS  = "0,0"        # change to "0,0" if you want it on-screen for debugging
-
-PROFILE_DIR_SCRAPER = os.path.join(os.getcwd(), "x_profile")
-PROFILE_DIR_POSTER  = os.path.join(os.getcwd(), "x_poster_profile")
-
-# =======================
-# Chrome channel control
-# =======================
 CHROME_BETA_BIN   = r"C:\Program Files\Google\Chrome Beta\Application\chrome.exe"
 CHROME_STABLE_BIN = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-
-# If you're forcing Beta 145, keep this at 145.
-# If you want UC to auto-detect, set to None (but then mismatches can happen after updates).
-FORCE_CHROME_MAJOR = 145  # set to 144 if staying on stable 144; or None to auto
+PROFILE_DIR_SCRAPER = os.path.join(os.getcwd(), "x_profile")
+PROFILE_DIR_POSTER  = os.path.join(os.getcwd(), "x_poster_profile")
 
 
 def _pick_chrome_binary() -> str:
