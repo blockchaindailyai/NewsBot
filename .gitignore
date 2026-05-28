@@ -5,3 +5,9 @@
 .env.txt
 backup/
 
+
+.env.txt
+.env
+.env*
+backup/
+
