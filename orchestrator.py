@@ -4,6 +4,7 @@ import time
 import threading
 import subprocess
 import logging
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from queue import Queue, Empty
 
@@ -42,6 +43,9 @@ from config import (
     SCRAPE_BACKOFF_LONG_SECONDS,
     SCRAPE_FAILURE_THRESHOLD,
     LOOP_SLEEP_SECONDS,
+    ACTIVE_LOOP_SLEEP_SECONDS,
+    MAX_ANALYSIS_WORKERS,
+    ANALYSIS_QUEUE_MAXSIZE,
 )
 
 logger = logging.getLogger("orchestrator")
@@ -359,6 +363,20 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
     safe_print("[EXIT] post_sender thread exiting.")
 
 
+
+
+def _log_analysis_future_error(fut: Future):
+    try:
+        fut.result()
+    except Exception as e:
+        safe_print(f"[ERROR] Analysis worker crashed: {e!r}")
+
+
+def _trim_done_futures(futures: set[Future]):
+    done = {f for f in futures if f.done()}
+    if done:
+        futures.difference_update(done)
+
 def run_bot():
     """
     Main bot session with threading:
@@ -396,6 +414,8 @@ def run_bot():
     safe_print("[INIT] Starting continuous scraping loop.\n")
 
     post_queue: Queue = Queue()
+    analysis_pool = ThreadPoolExecutor(max_workers=max(1, MAX_ANALYSIS_WORKERS))
+    analysis_futures: set[Future] = set()
 
     listener_thread = threading.Thread(target=input_listener, daemon=True)
     listener_thread.start()
@@ -449,12 +469,20 @@ def run_bot():
                         seen_ids.add(tid)
                         append_seen_id(tid)
 
-                        worker = threading.Thread(
-                            target=analyze_tweet_worker,
-                            args=(tid, username, text, post_queue),
-                            daemon=True,
+                        _trim_done_futures(analysis_futures)
+                        if len(analysis_futures) >= max(1, ANALYSIS_QUEUE_MAXSIZE):
+                            safe_print(f"[ANALYSIS] Backpressure active; skipping tweet {tid} this cycle.")
+                            continue
+
+                        fut = analysis_pool.submit(
+                            analyze_tweet_worker,
+                            tid,
+                            username,
+                            text,
+                            post_queue,
                         )
-                        worker.start()
+                        fut.add_done_callback(_log_analysis_future_error)
+                        analysis_futures.add(fut)
 
                     except Exception as e:
                         safe_print(f"[ERROR] Failed handling tweet {tid}: {e!r}")
@@ -465,7 +493,8 @@ def run_bot():
             except Exception as e:
                 safe_print(f"[WARN] Failed to save signal stats: {e!r}")
 
-            for _ in range(LOOP_SLEEP_SECONDS):
+            cycle_sleep = ACTIVE_LOOP_SLEEP_SECONDS if tweets else LOOP_SLEEP_SECONDS
+            for _ in range(max(1, cycle_sleep)):
                 if runtime.should_exit:
                     break
                 time.sleep(1)
@@ -474,6 +503,12 @@ def run_bot():
 
     finally:
         runtime.stop_event.set()
+
+        try:
+            safe_print("[EXIT] Waiting for in-flight analysis tasks...")
+            analysis_pool.shutdown(wait=True, cancel_futures=False)
+        except Exception as e:
+            safe_print(f"[WARN] Failed waiting for analysis tasks: {e!r}")
 
         try:
             safe_print("[EXIT] Waiting for post_queue to drain...")
