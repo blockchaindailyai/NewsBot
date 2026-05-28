@@ -1,15 +1,45 @@
 import os
 import re
 import json
+import time
+import random
+import logging
 from typing import Optional
 
 from openai import OpenAI
 from headline_compress import compress_headline_local
+from config import (
+    OPENAI_TIMEOUT_SECONDS,
+    OPENAI_RETRY_ATTEMPTS,
+    OPENAI_RETRY_BASE_DELAY,
+    OPENAI_FAILURE_COOLDOWN_SECONDS,
+)
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 if not API_KEY:
     print("[GPT-WARN] OPENAI_API_KEY is not set. Importance analysis will always fail.")
 client = OpenAI(api_key=API_KEY) if API_KEY else None
+logger = logging.getLogger("gpt_client")
+_failure_until = 0.0
+
+
+def _chat_completion_with_retry(**kwargs):
+    global _failure_until
+    now = time.time()
+    if now < _failure_until:
+        return None
+
+    for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
+        try:
+            return client.chat.completions.create(timeout=OPENAI_TIMEOUT_SECONDS, **kwargs)
+        except Exception as e:
+            if attempt >= OPENAI_RETRY_ATTEMPTS:
+                logger.error("OpenAI request failed after retries: %r", e)
+                _failure_until = time.time() + OPENAI_FAILURE_COOLDOWN_SECONDS
+                return None
+            delay = OPENAI_RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+            logger.warning("OpenAI request failed (attempt %s/%s): %r; retrying in %.2fs", attempt, OPENAI_RETRY_ATTEMPTS, e, delay)
+            time.sleep(delay)
 
 
 def _token_set(text: str) -> set[str]:
@@ -138,13 +168,16 @@ Return ONLY a single character:
 """.strip()
 
     try:
-        resp = client.chat.completions.create(
+        resp = _chat_completion_with_retry(
             model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt, "cache": True},
                 {"role": "user", "content": user_prompt},
             ],
         )
+
+        if resp is None:
+            return None
 
         raw = (resp.choices[0].message.content or "").strip()
 
@@ -237,7 +270,7 @@ TWEET TEXT:
 """.strip()
 
     try:
-        resp = client.chat.completions.create(
+        resp = _chat_completion_with_retry(
             model="gpt-5-mini",
             messages=[
                 {
@@ -248,6 +281,9 @@ TWEET TEXT:
                 {"role": "user", "content": prompt},
             ],
         )
+        if resp is None:
+            return None
+
         headline = (resp.choices[0].message.content or "").strip()
 
         # Try to extract the first line that begins with the alert emoji.
@@ -376,13 +412,16 @@ Reply with ONLY:
 """.strip()
 
     try:
-        resp = client.chat.completions.create(
+        resp = _chat_completion_with_retry(
             model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt, "cache": True},
                 {"role": "user", "content": user_prompt},
             ],
         )
+        if resp is None:
+            return None
+
         raw = (resp.choices[0].message.content or "").strip()
         if not raw:
             return False
