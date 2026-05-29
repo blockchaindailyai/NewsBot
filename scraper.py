@@ -20,11 +20,35 @@ def _matches_ad_label(value: str) -> bool:
     normalized = _normalized_text(value)
     if not normalized:
         return False
-    return normalized in {_normalized_text(label) for label in SCRAPER_AD_LABELS}
+
+    for raw_label in SCRAPER_AD_LABELS:
+        label = _normalized_text(raw_label)
+        if not label:
+            continue
+        if normalized == label:
+            return True
+        if len(label) > 2 and normalized.startswith(f"{label} "):
+            return True
+        if len(label) <= 2 and normalized.startswith(f"{label} ·"):
+            return True
+        if len(label) <= 2 and normalized.startswith(f"{label} by "):
+            return True
+
+    return False
 
 
 def is_promoted_article(article) -> bool:
     """Return True when an X timeline article is marked as an ad/promoted post."""
+    try:
+        ad_links = article.find_elements(
+            By.XPATH,
+            ".//a[contains(@href, '/i/ads') or contains(translate(@href, 'PROMOTED', 'promoted'), 'promoted')]",
+        )
+        if ad_links:
+            return True
+    except Exception:
+        pass
+
     marker_xpaths = (
         ".//*[@data-testid='socialContext']",
         ".//*[@aria-label]",
@@ -54,71 +78,114 @@ def is_promoted_article(article) -> bool:
 
 
 AD_BLOCKING_SCRIPT = r"""
-const labels = new Set((arguments[0] || []).map((value) =>
-  String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase()
-));
-const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
-const isAdLabel = (value) => labels.has(normalize(value));
-const articleIsPromoted = (article) => {
-  if (!article) return false;
+(() => {
+  const labels = new Set((arguments[0] || []).map((value) =>
+    String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+  ).filter(Boolean));
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+  const isAdLabel = (value) => {
+    const normalized = normalize(value);
+    if (!normalized) return false;
+    for (const label of labels) {
+      if (normalized === label) return true;
+      if (label.length > 2 && normalized.startsWith(`${label} `)) return true;
+      if (label.length <= 2 && normalized.startsWith(`${label} ·`)) return true;
+      if (label.length <= 2 && normalized.startsWith(`${label} by `)) return true;
+    }
+    return false;
+  };
   const markerSelector = [
     '[data-testid="socialContext"]',
     '[aria-label]',
+    'a[href*="/i/ads"]',
+    'a[href*="promoted"]',
     'span',
     'div'
   ].join(',');
-  for (const node of article.querySelectorAll(markerSelector)) {
-    if (node.closest('[data-testid="tweetText"]')) continue;
-    if (isAdLabel(node.getAttribute('aria-label')) || isAdLabel(node.textContent)) {
-      return true;
-    }
-  }
-  return false;
-};
-const removeMedia = (article) => {
-  for (const media of article.querySelectorAll('video, audio, source, img[src*="/amplify_video/"], [data-testid="videoPlayer"]')) {
-    try {
-      if (typeof media.pause === 'function') media.pause();
-      media.removeAttribute('src');
-      media.load?.();
-      media.remove();
-    } catch (_) {}
-  }
-};
-const prune = (root = document) => {
-  let removed = 0;
-  for (const article of root.querySelectorAll?.('article') || []) {
-    if (articleIsPromoted(article)) {
-      removeMedia(article);
-      article.remove();
-      removed += 1;
-    }
-  }
-  return removed;
-};
-window.__newsbotPrunePromotedArticles = prune;
-if (!window.__newsbotPromotedArticleObserver) {
-  window.__newsbotPromotedArticleObserver = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      for (const node of mutation.addedNodes || []) {
-        if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        if (node.matches?.('article')) {
-          if (articleIsPromoted(node)) {
-            removeMedia(node);
-            node.remove();
-          }
-        } else {
-          prune(node);
-        }
+  const articleIsPromoted = (article) => {
+    if (!article) return false;
+    for (const link of article.querySelectorAll('a[href]')) {
+      const href = link.getAttribute('href') || '';
+      if (href.includes('/i/ads') || href.toLocaleLowerCase().includes('promoted')) {
+        return true;
       }
     }
-  });
-  window.__newsbotPromotedArticleObserver.observe(document.body || document.documentElement, {
-    childList: true,
-    subtree: true,
-  });
-}
-return prune();
+    for (const node of article.querySelectorAll(markerSelector)) {
+      if (node.closest('[data-testid="tweetText"]')) continue;
+      if (isAdLabel(node.getAttribute('aria-label')) || isAdLabel(node.textContent)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const removeMedia = (article) => {
+    for (const media of article.querySelectorAll('video, audio, source, img[src*="/amplify_video/"], [data-testid="videoPlayer"]')) {
+      try {
+        if (typeof media.pause === 'function') media.pause();
+        media.removeAttribute('src');
+        media.load?.();
+        media.remove();
+      } catch (_) {}
+    }
+  };
+  const removeArticle = (article) => {
+    removeMedia(article);
+    article.setAttribute('data-newsbot-ad-removed', 'true');
+    article.style.setProperty('display', 'none', 'important');
+    article.remove();
+  };
+  const prune = (root = document) => {
+    let removed = 0;
+    const articles = [];
+    if (root.matches?.('article')) articles.push(root);
+    for (const article of root.querySelectorAll?.('article') || []) articles.push(article);
+    for (const article of articles) {
+      if (articleIsPromoted(article)) {
+        removeArticle(article);
+        removed += 1;
+      }
+    }
+    return removed;
+  };
+  window.__newsbotPrunePromotedArticles = prune;
+  if (!window.__newsbotPromotedArticleObserver) {
+    let scheduled = false;
+    const schedulePrune = (root = document) => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        prune(root);
+      });
+    };
+    window.__newsbotPromotedArticleObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target?.parentElement;
+        if (targetElement?.closest?.('[data-testid="tweetText"]')) continue;
+        const targetArticle = targetElement?.closest?.('article');
+        if (targetArticle) {
+          schedulePrune(targetArticle);
+          continue;
+        }
+        for (const node of mutation.addedNodes || []) {
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          schedulePrune(node);
+        }
+      }
+    });
+    window.__newsbotPromotedArticleObserver.observe(document.body || document.documentElement, {
+      attributes: true,
+      attributeFilter: ['aria-label', 'href', 'data-testid'],
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    window.__newsbotPromotedArticleInterval = setInterval(() => prune(), 1000);
+  }
+  return prune();
+})();
 """
 
 

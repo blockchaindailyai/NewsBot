@@ -61,6 +61,7 @@ from scraper import (
     AD_BLOCKING_SCRIPT,
     install_ad_blocking_script,
     is_promoted_article,
+    _matches_ad_label,
     prune_promoted_articles,
     remove_article,
     scrape_home_tweets,
@@ -81,6 +82,8 @@ class FakeElement:
             return []
         if value in self.elements:
             return self.elements[value]
+        if "/i/ads" in value or "promoted" in value.lower():
+            return self.elements.get("ad_links", [])
         if "@data-testid='socialContext'" in value:
             return self.elements.get("social_context", [])
         if "@aria-label" in value:
@@ -115,7 +118,7 @@ class FakeDriver(FakeElement):
 
 
 class ScraperAdBlockingTests(unittest.TestCase):
-    def _article(self, tweet_id, username, text, social_context=None):
+    def _article(self, tweet_id, username, text, social_context=None, ad_href=None):
         status_link = FakeElement(attributes={"href": f"https://x.com/{username[1:]}/status/{tweet_id}"})
         user = FakeElement(text=username)
         tweet_text = FakeElement(text=text)
@@ -126,12 +129,29 @@ class ScraperAdBlockingTests(unittest.TestCase):
         }
         if social_context is not None:
             elements["social_context"] = [FakeElement(text=social_context)]
+        if ad_href is not None:
+            elements["ad_links"] = [FakeElement(attributes={"href": ad_href})]
         return FakeElement(elements=elements)
 
     def test_promoted_social_context_is_identified_as_ad(self):
         article = self._article("123", "@macro", "Useful news", social_context="Promoted")
 
         self.assertTrue(is_promoted_article(article))
+
+    def test_promoted_by_social_context_is_identified_as_ad(self):
+        article = self._article("123", "@macro", "Useful news", social_context="Promoted by Acme")
+
+        self.assertTrue(is_promoted_article(article))
+
+    def test_i_ads_link_is_identified_as_ad(self):
+        article = self._article("123", "@macro", "Useful news", ad_href="https://x.com/i/ads/123")
+
+        self.assertTrue(is_promoted_article(article))
+
+    def test_short_ad_label_allows_delimited_variants_only(self):
+        self.assertTrue(_matches_ad_label("Ad · Acme"))
+        self.assertTrue(_matches_ad_label("Ad by Acme"))
+        self.assertFalse(_matches_ad_label("Markets advance after Fed decision"))
 
     def test_scrape_home_tweets_skips_promoted_articles(self):
         organic = self._article("123", "@macro", "Central bank cuts rates")
@@ -152,6 +172,9 @@ class ScraperAdBlockingTests(unittest.TestCase):
         script, args = driver.scripts[0]
         self.assertIs(script, AD_BLOCKING_SCRIPT)
         self.assertIn("Promoted", args[0])
+        self.assertIn("characterData: true", script)
+        self.assertIn("setInterval", script)
+        self.assertIn("parentElement", script)
 
     def test_prune_promoted_articles_calls_in_page_pruner(self):
         driver = FakeDriver(script_results=[3])
