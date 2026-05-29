@@ -18,7 +18,11 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from config import STORY_REGISTRY_PATH, NON_RECURRING_DUP_WINDOW_HOURS
+from config import (
+    DEDUPE_AUDIT_PATH,
+    STORY_REGISTRY_PATH,
+    NON_RECURRING_DUP_WINDOW_HOURS,
+)
 from story_dedupe import StoryFingerprint
 
 _LOCK = threading.Lock()
@@ -26,6 +30,7 @@ _LOADED = False
 _RECORDS: list[dict[str, Any]] = []
 _RECURRING_KEYS: set[str] = set()
 _EXACT_KEYS: set[str] = set()
+_CANONICAL_KEYS: set[str] = set()
 
 
 def _utc_now() -> datetime:
@@ -68,13 +73,20 @@ def _exact_key(fp: StoryFingerprint) -> str:
     return f"exact:{fp.exact_key}"
 
 
+def _canonical_key(fp: StoryFingerprint) -> str:
+    return _recurring_key(fp) or _story_key(fp) or _exact_key(fp)
+
+
 def _index_record(record: dict[str, Any]) -> None:
     exact_key = record.get("exact_key")
     recurring_key = record.get("recurring_key")
+    canonical_key = record.get("canonical_key")
     if exact_key:
         _EXACT_KEYS.add(str(exact_key))
     if recurring_key:
         _RECURRING_KEYS.add(str(recurring_key))
+    if canonical_key:
+        _CANONICAL_KEYS.add(str(canonical_key))
 
 
 def load_story_registry() -> None:
@@ -102,6 +114,11 @@ def load_story_registry() -> None:
             print(f"[STORY-REGISTRY-WARN] Failed to load story registry: {e}")
 
 
+def get_canonical_key(fp: StoryFingerprint) -> str:
+    """Return the best structured key for this story fingerprint."""
+    return _canonical_key(fp)
+
+
 def has_historical_duplicate(fp: StoryFingerprint) -> bool:
     """
     High-precision historical duplicate check.
@@ -117,8 +134,9 @@ def has_historical_duplicate(fp: StoryFingerprint) -> bool:
     story_key = _story_key(fp)
 
     with _LOCK:
+        canonical_key = _canonical_key(fp)
         if recurring_key:
-            return recurring_key in _RECURRING_KEYS
+            return recurring_key in _RECURRING_KEYS or canonical_key in _CANONICAL_KEYS
 
         if exact_key and exact_key in _EXACT_KEYS and not fp.is_recurring:
             return True
@@ -142,6 +160,8 @@ def save_story_record(
     fingerprint: StoryFingerprint,
     tweet_id: str,
     username: str,
+    source_tweet_ids: list[str] | None = None,
+    source_accounts: list[str] | None = None,
 ) -> None:
     """Append structured metadata for a posted story."""
     load_story_registry()
@@ -154,10 +174,13 @@ def save_story_record(
         "exact_key": _exact_key(fingerprint),
         "story_key": _story_key(fingerprint),
         "recurring_key": _recurring_key(fingerprint),
+        "canonical_key": _canonical_key(fingerprint),
         "entity_action_key": fingerprint.entity_action_key,
         "is_recurring": fingerprint.is_recurring,
         "period_key": fingerprint.period_key,
         "tokens": sorted(fingerprint.token_set),
+        "source_tweet_ids": source_tweet_ids or [str(tweet_id)],
+        "source_accounts": source_accounts or ([username] if username else []),
     }
 
     with _LOCK:
@@ -168,3 +191,17 @@ def save_story_record(
                 f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         except Exception as e:
             print(f"[STORY-REGISTRY-WARN] Failed to write story registry: {e}")
+
+
+def append_dedupe_audit(event: str, **details: Any) -> None:
+    """Persist lightweight dedupe decisions for later tuning/debugging."""
+    payload = {
+        "created_at": _iso_now(),
+        "event": event,
+        **details,
+    }
+    try:
+        with open(DEDUPE_AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as e:
+        print(f"[DEDUPE-AUDIT-WARN] Failed to write audit event: {e}")

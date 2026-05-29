@@ -1,3 +1,4 @@
+import json
 import os
 
 
@@ -28,6 +29,17 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_json_map(name: str) -> dict:
+    raw = os.getenv(name)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "BCDNewsBot")
 COOKIE_PATH = os.getenv("COOKIE_PATH", "twitter_cookies.pkl")
 
@@ -42,7 +54,9 @@ MAX_ANALYSIS_WORKERS = _get_int("MAX_ANALYSIS_WORKERS", 6)
 ANALYSIS_QUEUE_MAXSIZE = _get_int("ANALYSIS_QUEUE_MAXSIZE", 200)
 
 STORY_REGISTRY_PATH = os.getenv("STORY_REGISTRY_PATH", "story_registry.jsonl")
+DEDUPE_AUDIT_PATH = os.getenv("DEDUPE_AUDIT_PATH", "dedupe_audit.jsonl")
 NON_RECURRING_DUP_WINDOW_HOURS = _get_int("NON_RECURRING_DUP_WINDOW_HOURS", 72)
+ACCOUNT_TRUST_SCORES = _get_json_map("ACCOUNT_TRUST_SCORES_JSON")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 OPENAI_TIMEOUT_SECONDS = _get_float("OPENAI_TIMEOUT_SECONDS", 25.0)

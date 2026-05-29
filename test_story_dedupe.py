@@ -1,7 +1,7 @@
 import unittest
 
 from headline_dedupe import is_local_duplicate
-from story_dedupe import build_story_fingerprint, likely_same_batch_story
+from story_dedupe import account_trust_score, build_story_fingerprint, likely_same_batch_story
 
 
 class StoryDedupeTests(unittest.TestCase):
@@ -32,6 +32,9 @@ class StoryDedupeTests(unittest.TestCase):
                 tweet_text="US MAY CPI 3.4% VS 3.4% EST",
             )
         )
+
+    def test_official_account_gets_trust_boost(self):
+        self.assertGreater(account_trust_score("@SECGov"), account_trust_score("@unknown"))
 
 
 if __name__ == "__main__":

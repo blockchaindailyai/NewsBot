@@ -68,6 +68,8 @@ from headline_dedupe import is_local_duplicate
 from local_headline_fallback import generate_blockchain_daily_headline
 from story_dedupe import StoryFingerprint, build_story_fingerprint
 from story_registry import (
+    append_dedupe_audit,
+    get_canonical_key,
     has_historical_duplicate,
     load_story_registry,
     save_story_record,
@@ -122,7 +124,13 @@ def _claim_story_slot(story_keys: tuple[str, ...]) -> bool:
 # ---------------------------- Main Entry ---------------------------- #
 
 
-def analyze_tweet_importance(tweet_id, username, text, story_fp: StoryFingerprint | None = None):
+def analyze_tweet_importance(
+    tweet_id,
+    username,
+    text,
+    story_fp: StoryFingerprint | None = None,
+    supporting_tweets=None,
+):
     """
     Analyze a tweet's importance for a crypto/news bot and optionally
     produce a headline.
@@ -143,14 +151,28 @@ def analyze_tweet_importance(tweet_id, username, text, story_fp: StoryFingerprin
     # ---------- (1) Local fallback headline + high-precision fingerprint (no GPT) ---------- #
     story_fp = story_fp or build_story_fingerprint(text)
     candidate_pre = story_fp.fallback_headline or generate_blockchain_daily_headline(text)
+    supporting_tweets = supporting_tweets or [(tweet_id_str, username)]
+    source_tweet_ids = [str(tid) for tid, _ in supporting_tweets]
+    source_accounts = [acct for _, acct in supporting_tweets if acct]
+    canonical_key = get_canonical_key(story_fp)
 
     # ---------- (2) Structured + legacy exact historical dedupe (pre-GPT) ---------- #
     # Structured registry checks are period-aware. Legacy exact headline checks are
     # only used where they cannot suppress a recurring story without a period.
     try:
         can_use_exact_history = (not story_fp.is_recurring) or bool(story_fp.period_key)
-        if has_historical_duplicate(story_fp) or (can_use_exact_history and seen_full_preapi(candidate_pre)):
-            # Story already covered in prior runs.
+        structured_dup = has_historical_duplicate(story_fp)
+        legacy_dup = can_use_exact_history and seen_full_preapi(candidate_pre)
+        if structured_dup or legacy_dup:
+            append_dedupe_audit(
+                "historical_duplicate_skipped",
+                tweet_id=tweet_id_str,
+                username=username,
+                canonical_key=canonical_key,
+                reason="structured_registry" if structured_dup else "legacy_headline",
+                is_recurring=story_fp.is_recurring,
+                period_key=story_fp.period_key,
+            )
             return {
                 "tweet_id": tweet_id_str,
                 "importance_score": 0,
@@ -260,6 +282,8 @@ def analyze_tweet_importance(tweet_id, username, text, story_fp: StoryFingerprin
                 fingerprint=story_fp,
                 tweet_id=tweet_id_str,
                 username=username,
+                source_tweet_ids=source_tweet_ids,
+                source_accounts=source_accounts,
             )
             return {
                 "tweet_id": tweet_id_str,

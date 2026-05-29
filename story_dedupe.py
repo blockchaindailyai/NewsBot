@@ -13,6 +13,7 @@ from difflib import SequenceMatcher
 
 from local_headline_fallback import generate_blockchain_daily_headline
 from headline_store import normalize_headline_for_key
+from config import ACCOUNT_TRUST_SCORES
 
 
 _STOPWORDS = {
@@ -186,6 +187,34 @@ def likely_same_batch_story(a: StoryFingerprint, b: StoryFingerprint) -> bool:
     return jacc >= 0.62 and seq >= 0.72
 
 
+def _normalized_handle(username: str) -> str:
+    handle = (username or "").strip().lower()
+    return handle if handle.startswith("@") else f"@{handle}" if handle else ""
+
+
+def account_trust_score(username: str) -> float:
+    """Small, configurable boost for choosing the best duplicate representative."""
+    handle = _normalized_handle(username)
+    if not handle:
+        return -0.15
+
+    configured = ACCOUNT_TRUST_SCORES.get(handle) or ACCOUNT_TRUST_SCORES.get(handle.lstrip("@"))
+    if configured is not None:
+        try:
+            return float(configured)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Conservative generic defaults; operators can override via
+    # ACCOUNT_TRUST_SCORES_JSON for their own source list.
+    official_markers = ("secgov", "federalreserve", "treasury", "cftc", "whitehouse")
+    if any(marker in handle for marker in official_markers):
+        return 1.0
+    if handle == "@unknown":
+        return -0.25
+    return 0.0
+
+
 def representative_score(username: str, text: str, fingerprint: StoryFingerprint) -> float:
     """Pick the richest/clearest tweet from a duplicate group."""
     score = 0.0
@@ -196,8 +225,7 @@ def representative_score(username: str, text: str, fingerprint: StoryFingerprint
         score += 0.35
     if fingerprint.period_key:
         score += 0.25
-    if username and username.lower() != "@unknown":
-        score += 0.10
+    score += account_trust_score(username)
     if re.search(r"\b(rumor|unconfirmed|source|sources)\b", text or "", flags=re.I):
         score -= 0.30
     return score

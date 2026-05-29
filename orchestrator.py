@@ -36,6 +36,7 @@ from story_dedupe import (
     likely_same_batch_story,
     representative_score,
 )
+from story_registry import append_dedupe_audit, get_canonical_key
 
 from storage import (
     load_seen_ids,
@@ -149,7 +150,7 @@ def input_listener():
             break
 
 
-def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=None):
+def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=None, supporting_tweets=None):
     """
     Per-tweet analysis worker.
 
@@ -159,7 +160,13 @@ def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=N
     - If a new headline is found, enqueue it for the post_sender thread.
     """
     try:
-        analysis = analyze_tweet_importance(tweet_id, username, text, story_fp=story_fp)
+        analysis = analyze_tweet_importance(
+            tweet_id,
+            username,
+            text,
+            story_fp=story_fp,
+            supporting_tweets=supporting_tweets,
+        )
     except Exception as e:
         safe_print(f"[ERROR] Failed analyzing tweet {tweet_id}: {e!r}")
         return
@@ -446,14 +453,27 @@ def _prefilter_unique_stories_batch(tweets):
     unique = []
     for group in groups:
         rep_tid, rep_username, rep_text, rep_fp = group["representative"]
-        unique.append((rep_tid, rep_username, rep_text, rep_fp))
+        supporting = [(tid, username) for tid, username, _, _ in group["items"]]
+        unique.append((rep_tid, rep_username, rep_text, rep_fp, supporting))
 
-        if DEBUG_QUEUE_LOGS and len(group["items"]) > 1:
+        if len(group["items"]) > 1:
             skipped = [tid for tid, _, _, _ in group["items"] if tid != rep_tid]
-            safe_print(
-                f"[DEDUP-BATCH] Kept representative tweet {rep_tid}; "
-                f"skipped same-batch duplicates: {', '.join(skipped)}"
+            append_dedupe_audit(
+                "batch_duplicate_grouped",
+                kept_tweet_id=rep_tid,
+                kept_username=rep_username,
+                skipped_tweet_ids=skipped,
+                source_tweet_ids=[tid for tid, _ in supporting],
+                source_accounts=[username for _, username in supporting],
+                canonical_key=get_canonical_key(rep_fp) if rep_fp is not None else "",
+                is_recurring=bool(rep_fp and rep_fp.is_recurring),
+                period_key=(rep_fp.period_key if rep_fp is not None else ""),
             )
+            if DEBUG_QUEUE_LOGS:
+                safe_print(
+                    f"[DEDUP-BATCH] Kept representative tweet {rep_tid}; "
+                    f"skipped same-batch duplicates: {', '.join(skipped)}"
+                )
 
     return unique
 
@@ -556,7 +576,7 @@ def run_bot():
 
                 unique_candidates = _prefilter_unique_stories_batch(batch_candidates)
 
-                for tid, username, text, story_fp in unique_candidates:
+                for tid, username, text, story_fp, supporting_tweets in unique_candidates:
                     try:
                         _trim_done_futures(analysis_futures)
                         if len(analysis_futures) >= max(1, ANALYSIS_QUEUE_MAXSIZE):
@@ -570,6 +590,7 @@ def run_bot():
                             text,
                             post_queue,
                             story_fp,
+                            supporting_tweets,
                         )
                         fut.add_done_callback(_log_analysis_future_error)
                         analysis_futures.add(fut)
