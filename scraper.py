@@ -4,7 +4,7 @@
 
 import time
 
-from config import SCRAPER_AD_LABELS
+from config import SCRAPER_AD_LABELS, SCRAPER_BLOCK_AD_URL_PATTERNS
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -37,14 +37,36 @@ def _matches_ad_label(value: str) -> bool:
     return False
 
 
+def _attribute_contains_ad_marker(value: str) -> bool:
+    normalized = (value or "").casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "/i/ads",
+            "/i/adsct",
+            "promoted",
+            "promoted_content",
+            "promoted_tweet",
+            "data-testid=placementtracking",
+        )
+    )
+
+
 def is_promoted_article(article) -> bool:
     """Return True when an X timeline article is marked as an ad/promoted post."""
     try:
         ad_links = article.find_elements(
             By.XPATH,
-            ".//a[contains(@href, '/i/ads') or contains(translate(@href, 'PROMOTED', 'promoted'), 'promoted')]",
+            ".//a[contains(@href, '/i/ads') or contains(@href, '/i/adsct') or contains(translate(@href, 'PROMOTED', 'promoted'), 'promoted')]",
         )
         if ad_links:
+            return True
+    except Exception:
+        pass
+
+    try:
+        tracking_nodes = article.find_elements(By.XPATH, ".//*[@data-testid='placementTracking']")
+        if tracking_nodes:
             return True
     except Exception:
         pass
@@ -62,11 +84,13 @@ def is_promoted_article(article) -> bool:
             continue
 
         for candidate in candidates:
-            try:
-                if _matches_ad_label(candidate.get_attribute("aria-label") or ""):
-                    return True
-            except Exception:
-                pass
+            for attr in ("aria-label", "title", "href", "data-testid"):
+                try:
+                    value = candidate.get_attribute(attr) or ""
+                    if _matches_ad_label(value) or _attribute_contains_ad_marker(value):
+                        return True
+                except Exception:
+                    pass
 
             try:
                 if _matches_ad_label(candidate.text):
@@ -94,25 +118,43 @@ AD_BLOCKING_SCRIPT = r"""
     }
     return false;
   };
+  const adAttrMarkers = [
+    '/i/ads',
+    '/i/adsct',
+    'promoted',
+    'promoted_content',
+    'promoted_tweet'
+  ];
+  const containsAdMarker = (value) => {
+    const normalized = normalize(value);
+    return adAttrMarkers.some((marker) => normalized.includes(marker));
+  };
   const markerSelector = [
     '[data-testid="socialContext"]',
+    '[data-testid="placementTracking"]',
     '[aria-label]',
+    '[title]',
     'a[href*="/i/ads"]',
+    'a[href*="/i/adsct"]',
     'a[href*="promoted"]',
     'span',
     'div'
   ].join(',');
   const articleIsPromoted = (article) => {
     if (!article) return false;
+    if (article.querySelector('[data-testid="placementTracking"]')) return true;
     for (const link of article.querySelectorAll('a[href]')) {
-      const href = link.getAttribute('href') || '';
-      if (href.includes('/i/ads') || href.toLocaleLowerCase().includes('promoted')) {
-        return true;
-      }
+      if (containsAdMarker(link.getAttribute('href') || '')) return true;
     }
     for (const node of article.querySelectorAll(markerSelector)) {
       if (node.closest('[data-testid="tweetText"]')) continue;
-      if (isAdLabel(node.getAttribute('aria-label')) || isAdLabel(node.textContent)) {
+      const attrs = [
+        node.getAttribute('aria-label'),
+        node.getAttribute('title'),
+        node.getAttribute('href'),
+        node.getAttribute('data-testid')
+      ];
+      if (attrs.some((value) => isAdLabel(value) || containsAdMarker(value)) || isAdLabel(node.textContent)) {
         return true;
       }
     }
@@ -129,9 +171,10 @@ AD_BLOCKING_SCRIPT = r"""
     }
   };
   const removeArticle = (article) => {
-    removeMedia(article);
     article.setAttribute('data-newsbot-ad-removed', 'true');
+    article.style.setProperty('visibility', 'hidden', 'important');
     article.style.setProperty('display', 'none', 'important');
+    removeMedia(article);
     article.remove();
   };
   const prune = (root = document) => {
@@ -194,6 +237,25 @@ def extract_text_with_emojis(el):
         return el.text
     except Exception:
         return ""
+
+
+def setup_ad_blocking(driver) -> int:
+    """Configure network and document-level ad blocking before loading X."""
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": SCRAPER_BLOCK_AD_URL_PATTERNS})
+    except Exception:
+        pass
+
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": AD_BLOCKING_SCRIPT.replace("arguments[0]", repr(sorted(SCRAPER_AD_LABELS)))},
+        )
+    except Exception:
+        pass
+
+    return install_ad_blocking_script(driver)
 
 
 def install_ad_blocking_script(driver) -> int:
@@ -344,6 +406,7 @@ def recover_following_same_page(driver) -> bool:
 
 
 def open_home(driver):
+    setup_ad_blocking(driver)
     driver.get("https://x.com/home")
 
     try:
@@ -389,7 +452,9 @@ def scrape_home_tweets(driver):
     if is_tab_selected(driver, foryou_labels) and not is_tab_selected(driver, following_labels):
         ensure_following_selected(driver, timeout=1.8)
 
-    prune_promoted_articles(driver)
+    for _ in range(2):
+        prune_promoted_articles(driver)
+        time.sleep(0.1)
 
     tweets = []
     articles = driver.find_elements(By.XPATH, "//section//article")

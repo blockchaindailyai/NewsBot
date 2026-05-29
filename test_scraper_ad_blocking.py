@@ -65,6 +65,7 @@ from scraper import (
     prune_promoted_articles,
     remove_article,
     scrape_home_tweets,
+    setup_ad_blocking,
 )
 
 
@@ -86,6 +87,8 @@ class FakeElement:
             return self.elements.get("ad_links", [])
         if "@data-testid='socialContext'" in value:
             return self.elements.get("social_context", [])
+        if "@data-testid='placementTracking'" in value:
+            return self.elements.get("placement_tracking", [])
         if "@aria-label" in value:
             return self.elements.get("aria_labelled", [])
         if "normalize-space()" in value:
@@ -106,6 +109,11 @@ class FakeDriver(FakeElement):
         super().__init__(text=text, attributes=attributes, elements=elements)
         self.script_results = list(script_results or [])
         self.scripts = []
+        self.cdp_commands = []
+
+    def execute_cdp_cmd(self, command, params):
+        self.cdp_commands.append((command, params))
+        return {}
 
     def get(self, url):
         self.last_url = url
@@ -148,6 +156,22 @@ class ScraperAdBlockingTests(unittest.TestCase):
 
         self.assertTrue(is_promoted_article(article))
 
+    def test_i_adsct_link_is_identified_as_ad(self):
+        article = self._article(
+            "123",
+            "@macro",
+            "Useful news",
+            ad_href="https://x.com/i/adsct?url=https%3A%2F%2Fexample.com",
+        )
+
+        self.assertTrue(is_promoted_article(article))
+
+    def test_placement_tracking_is_identified_as_ad(self):
+        article = self._article("123", "@macro", "Useful news")
+        article.elements["placement_tracking"] = [FakeElement()]
+
+        self.assertTrue(is_promoted_article(article))
+
     def test_short_ad_label_allows_delimited_variants_only(self):
         self.assertTrue(_matches_ad_label("Ad · Acme"))
         self.assertTrue(_matches_ad_label("Ad by Acme"))
@@ -175,6 +199,20 @@ class ScraperAdBlockingTests(unittest.TestCase):
         self.assertIn("characterData: true", script)
         self.assertIn("setInterval", script)
         self.assertIn("parentElement", script)
+
+    def test_setup_ad_blocking_installs_network_and_preload_guards(self):
+        driver = FakeDriver(script_results=[1])
+
+        removed = setup_ad_blocking(driver)
+
+        self.assertEqual(removed, 1)
+        commands = [command for command, _ in driver.cdp_commands]
+        self.assertIn("Network.enable", commands)
+        self.assertIn("Network.setBlockedURLs", commands)
+        self.assertIn("Page.addScriptToEvaluateOnNewDocument", commands)
+        preload = dict(driver.cdp_commands[-1][1])
+        self.assertIn("Promoted", preload["source"])
+        self.assertTrue(driver.scripts)
 
     def test_prune_promoted_articles_calls_in_page_pruner(self):
         driver = FakeDriver(script_results=[3])
