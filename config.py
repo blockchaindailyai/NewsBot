@@ -29,6 +29,14 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_csv_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return list(default)
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    return values or list(default)
+
+
 def _get_csv_set(name: str, default: set[str]) -> set[str]:
     raw = os.getenv(name)
     if raw is None:
@@ -70,6 +78,30 @@ SCRAPER_AD_LABELS = _get_csv_set(
         "광고",
         "프로모션",
     },
+)
+
+SCRAPER_ADBLOCK_EXTENSION_IDS = _get_csv_list(
+    "SCRAPER_ADBLOCK_EXTENSION_IDS",
+    [
+        "cjpalhdlnbpafiamejdnhcphjbkeiagm",  # uBlock Origin
+        "ddkjiahejlhfcafbddmgiahcphecmpfh",  # uBlock Origin Lite
+        "gighmmpiobklfepjocnamgkkbiglidom",  # AdBlock
+        "cfhdojbkjhnklbpkdaibdccddilifddb",  # Adblock Plus
+    ],
+)
+SCRAPER_ADBLOCK_EXTENSION_PATHS = _get_csv_list("SCRAPER_ADBLOCK_EXTENSION_PATHS", [])
+SCRAPER_BLOCK_AD_URL_PATTERNS = _get_csv_list(
+    "SCRAPER_BLOCK_AD_URL_PATTERNS",
+    [
+        "*://*.x.com/i/ads*",
+        "*://*.twitter.com/i/ads*",
+        "*://*.x.com/i/adsct*",
+        "*://*.twitter.com/i/adsct*",
+        "*://ads-twitter.com/*",
+        "*://*.ads-twitter.com/*",
+        "*://static.ads-twitter.com/*",
+        "*://analytics.twitter.com/*",
+    ],
 )
 
 STORY_REGISTRY_PATH = os.getenv("STORY_REGISTRY_PATH", "story_registry.jsonl")

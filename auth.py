@@ -3,6 +3,7 @@
 
 import os
 import time
+from pathlib import Path
 import undetected_chromedriver as uc
 from selenium.common.exceptions import SessionNotCreatedException
 
@@ -14,6 +15,8 @@ from config import (
     POSTER_WINDOW_SIZE,
     POSTER_WINDOW_POS,
     FORCE_CHROME_MAJOR,
+    SCRAPER_ADBLOCK_EXTENSION_IDS,
+    SCRAPER_ADBLOCK_EXTENSION_PATHS,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -25,6 +28,53 @@ CHROME_BETA_BIN   = r"C:\Program Files\Google\Chrome Beta\Application\chrome.exe
 CHROME_STABLE_BIN = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 PROFILE_DIR_SCRAPER = os.path.join(os.getcwd(), "x_profile")
 PROFILE_DIR_POSTER  = os.path.join(os.getcwd(), "x_poster_profile")
+
+
+def _profile_extension_versions(user_data_dir: str, extension_id: str) -> list[Path]:
+    base = Path(user_data_dir) / "Default" / "Extensions" / extension_id
+    if not base.is_dir():
+        return []
+    versions = [path for path in base.iterdir() if path.is_dir()]
+    return sorted(versions, key=lambda path: path.name, reverse=True)
+
+
+def _configured_adblock_extension_paths(user_data_dir: str, headless: bool) -> list[str]:
+    if headless:
+        return []
+
+    paths: list[str] = []
+    for raw_path in SCRAPER_ADBLOCK_EXTENSION_PATHS:
+        path = Path(raw_path).expanduser()
+        if path.is_dir():
+            paths.append(str(path.resolve()))
+        else:
+            print(f"[AUTH-WARN] Configured adblock extension path not found: {path}")
+
+    for extension_id in SCRAPER_ADBLOCK_EXTENSION_IDS:
+        for version_dir in _profile_extension_versions(user_data_dir, extension_id):
+            paths.append(str(version_dir.resolve()))
+            break
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(paths))
+
+
+def _configure_extensions(opts: uc.ChromeOptions, user_data_dir: str, headless: bool) -> None:
+    if headless:
+        opts.add_argument("--disable-extensions")
+        return
+
+    adblock_paths = _configured_adblock_extension_paths(user_data_dir, headless=headless)
+    if adblock_paths:
+        print(f"[AUTH] Loading adblock extension(s): {', '.join(adblock_paths)}")
+        opts.add_argument(f"--load-extension={','.join(adblock_paths)}")
+    else:
+        expected = Path(user_data_dir) / "Default" / "Extensions"
+        print(
+            "[AUTH-WARN] No configured/installed adblock extension found for visible scraper. "
+            "Install uBlock Origin/uBO Lite/AdBlock once into the scraper profile or set "
+            f"SCRAPER_ADBLOCK_EXTENSION_PATHS. Profile extension dir: {expected}"
+        )
 
 
 def _pick_chrome_binary() -> str:
@@ -46,10 +96,14 @@ def _make_options(user_data_dir: str, headless: bool, size: str, pos: str) -> uc
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-notifications")
-    opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--disable-features=IsolateOrigins,site-per-process")
     opts.add_argument("--force-device-scale-factor=1")
+
+    if os.path.abspath(user_data_dir) == os.path.abspath(PROFILE_DIR_SCRAPER):
+        _configure_extensions(opts, user_data_dir, headless=headless)
+    elif headless:
+        opts.add_argument("--disable-extensions")
 
     # Prevent throttling/occlusion issues (important for off-screen windows)
     opts.add_argument("--disable-background-timer-throttling")
