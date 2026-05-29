@@ -51,6 +51,146 @@ def _token_set(text: str) -> set[str]:
     return set(re.findall(r"[A-Z0-9]+", (text or "").upper()))
 
 
+def _normalize_generated_headline(headline: str) -> Optional[str]:
+    if not headline:
+        return None
+
+    headline = str(headline).strip()
+
+    # Try to extract the first line that begins with the alert emoji.
+    m = re.search(r"(🚨[^\n\r]*)", headline)
+    if m:
+        headline = m.group(1).strip()
+
+    if not headline:
+        return None
+
+    # Ensure a single leading 🚨.
+    if not headline.startswith("🚨"):
+        headline = f"🚨 {headline}"
+
+    # Strip BREAKING/#BREAKING immediately after the emoji; the account name
+    # already signals urgency and this avoids repetitive spam-like wording.
+    headline = re.sub(
+        r"^🚨\s*#?BREAKING[:\-\s]*\s*",
+        "🚨 ",
+        headline,
+        flags=re.IGNORECASE,
+    )
+
+    headline = re.sub(r"\s+", " ", headline).strip()
+
+    if headline.startswith("🚨"):
+        rest = headline[1:].strip()
+        headline = f"🚨 {rest.upper()}"
+    else:
+        headline = headline.upper()
+
+    return headline[:270].strip() or None
+
+
+def _json_from_response(raw: str) -> dict:
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+
+    # Be forgiving if the model wraps the JSON in prose or a code fence.
+    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not m:
+        return {}
+    try:
+        parsed = json.loads(m.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def analyze_tweet_for_publish(tweet_id: str, username: str, text: str) -> Optional[dict]:
+    """
+    Single-call GPT path: decide whether to publish and, if so, draft the
+    publishable headline in the same response.
+    """
+    if client is None:
+        return None
+
+    system_prompt = r"""
+You are an experienced financial news editor for a real-time crypto + US-macro newswire.
+
+Return ONLY valid JSON with this exact shape:
+{
+  "publish": 0 or 1,
+  "headline": null or "🚨 ALL-CAPS HEADLINE",
+  "reason": "very short internal reason"
+}
+
+DEFAULT = publish 0. Only a small minority of tweets should ever be publish 1.
+
+Publish only when the tweet clearly describes a concrete, market-relevant event involving at least one of:
+- major crypto assets/tickers, exchanges, issuers, regulators, or well-known crypto companies
+- US macro data/policy (CPI, PPI, PCE, NFP, GDP, jobless claims, Fed/FOMC/Treasury, rates, tariffs)
+- major US megacap equities or clearly market-moving finance events
+- major geopolitical escalations that are truly market moving
+
+Always publish 0 for routine commentary, memes, vague opinions, promos, Spaces/AMAs/watch-live posts with no substance, stale/ICYMI resharing, non-US routine data, and price chatter without a concrete percent/move/event.
+
+If publish is 1, headline rules:
+- Prefix with exactly one 🚨.
+- Uppercase English.
+- Keep under 140 characters when possible.
+- Do NOT include BREAKING or #BREAKING.
+- No hashtags except cashtags like $BTC or $AAPL.
+- Do not include @ handles unless the handle is itself the story.
+- Never invent facts; use only what the tweet explicitly says.
+- Capture the entity, action, and impact.
+- Do not include links; if a domain is necessary, write it like BITCOIN(.)COM.
+
+If publish is 0, headline must be null.
+""".strip()
+
+    user_prompt = f"""
+Tweet text:
+{text}
+
+Handle: {username}
+""".strip()
+
+    try:
+        resp = _chat_completion_with_retry(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": system_prompt, "cache": True},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        if resp is None:
+            return None
+
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _json_from_response(raw)
+        publish_raw = parsed.get("publish", 0)
+        publish = 1 if str(publish_raw).strip().lower() in {"1", "true", "yes"} else 0
+        headline = _normalize_generated_headline(parsed.get("headline") or "") if publish else None
+
+        # If the model marked publish but omitted a headline, let the caller use
+        # its deterministic fallback rather than spending another model round-trip.
+        return {
+            "tweet_id": str(tweet_id),
+            "importance_score": publish,
+            "label": "high" if publish else "low",
+            "headline": headline,
+            "reason": str(parsed.get("reason") or "").strip(),
+        }
+    except Exception as e:
+        print(f"[GPT-ERROR] analyze_tweet_for_publish failed for {tweet_id}: {e}")
+        return None
+
+
 def score_tweet_importance(tweet_id: str, username: str, text: str) -> Optional[dict]:
     """
     Call GPT to decide if a tweet should be published or not.
@@ -285,39 +425,7 @@ TWEET TEXT:
         if resp is None:
             return None
 
-        headline = (resp.choices[0].message.content or "").strip()
-
-        # Try to extract the first line that begins with the alert emoji.
-        m = re.search(r"(🚨[^\n\r]*)", headline)
-        if m:
-            headline = m.group(1).strip()
-        else:
-            headline = headline.strip()
-
-        # Ensure a single leading 🚨
-        if not headline.startswith("🚨"):
-            headline = f"🚨 {headline}"
-
-        # Strip any BREAKING/#BREAKING token that might still appear
-        # immediately after the emoji (for safety against cached behavior).
-        headline = re.sub(
-            r"^🚨\s*#?BREAKING[:\-\s]*\s*",
-            "🚨 ",
-            headline,
-            flags=re.IGNORECASE,
-        )
-
-        # Collapse whitespace
-        headline = re.sub(r"\s+", " ", headline).strip()
-
-        # Keep the emoji as-is, uppercase the rest
-        if headline.startswith("🚨"):
-            rest = headline[1:].strip()
-            headline = f"🚨 {rest.upper()}"
-        else:
-            headline = headline.upper()
-
-        return headline
+        return _normalize_generated_headline(resp.choices[0].message.content or "")
     except Exception as e:
         print(f"[GPT-HEADLINE-ERROR] {e}")
         return None

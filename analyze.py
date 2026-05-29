@@ -25,20 +25,19 @@ Flow summary:
        stories. Recurring scheduled data fails open to avoid suppressing
        important new releases that resemble older periods.
 
-  5) GPT IMPORTANCE SCORING (gpt-5-mini)
-     - If scoring fails: fallback to importance_score=0, no headline.
-     - If score <= 44 return score/label but no headline.
+  5) LIBERAL LOCAL REJECT FILTER (pre-GPT, no tokens)
+     - Skip only obvious no-news chatter/promos/link-only posts with no market signal.
 
-  6) GPT HEADLINE GENERATION (gpt-5.1)
-     - Generate a full 🚨#BREAKING: ALL-CAPS headline from the tweet text.
-     - If GPT fails, fall back to the local deterministic headline.
+  6) COMBINED GPT PUBLISH DECISION + HEADLINE (gpt-5-mini)
+     - Decide publish/no-publish and draft the 🚨 headline in one model call.
+     - If the model publishes but omits a headline, fall back to the local headline.
 
   7) POST-GPT LOCAL NEAR-DUPE (compressed Jaccard)
      - Compare the candidate GPT headline vs last 100 COMPRESSED headlines.
      - If highly similar: treat as duplicate story, return no headline.
 
   8) GPT-BASED DEDUPE vs RECENT COMPRESSED HEADLINES
-     - Ask GPT (cheap prompt) if this headline describes essentially the
+     - Ask GPT if this headline describes essentially the
        same story as any of the recent compressed headlines.
      - If GPT returns "duplicate": return no headline.
 
@@ -54,8 +53,7 @@ import threading
 import re
 
 from gpt_client import (
-    score_tweet_importance,
-    generate_headline_with_gpt,
+    analyze_tweet_for_publish,
     gpt_is_duplicate,
 )
 from headline_store import (
@@ -153,6 +151,61 @@ def _claim_story_slot(story_keys: tuple[str, ...]) -> bool:
             return False
         _STORY_KEYS.update(keys)
         return True
+
+
+_MATERIAL_SIGNAL_RE = re.compile(
+    r"(\$[A-Z]{1,6}\b|\b(BTC|ETH|SOL|XRP|USDT|USDC|DOGE|BNB|TRX|ADA|AVAX|"
+    r"BITCOIN|ETHEREUM|CRYPTO|STABLECOIN|ETF|FED|FOMC|CPI|PPI|PCE|NFP|GDP|"
+    r"JOBLESS|INFLATION|TREASURY|TARIFF|RATE|YIELD|SEC|CFTC|DOJ|NASDAQ|NYSE|"
+    r"AAPL|MSFT|NVDA|AMZN|META|TSLA|GOOGL|APPLE|MICROSOFT|NVIDIA|TESLA|"
+    r"BINANCE|COINBASE|KRAKEN|TETHER|CIRCLE)\b|\d+(?:\.\d+)?\s?%|\$\d)",
+    re.IGNORECASE,
+)
+
+_PROMO_ONLY_RE = re.compile(
+    r"\b(watch live|listen live|join us|set a reminder|spaces?|ama|webinar|podcast|"
+    r"subscribe|like and retweet|retweet to win|giveaway|airdrop|mint is live|"
+    r"whitelist|discord|telegram|link in bio|sign up|register now)\b",
+    re.IGNORECASE,
+)
+
+_EMPTY_CHATTER_RE = re.compile(
+    r"^(gm|gn|good morning|lol|lfg|wagmi|soon|big soon|👀|🔥|🚀|\.\.\.)[\s!.🚀🔥👀]*$",
+    re.IGNORECASE,
+)
+
+
+def _local_reject_reason(text: str) -> str | None:
+    """
+    Very liberal pre-GPT reject filter.
+
+    This only removes obvious no-news items. Anything with a market/entity signal
+    still flows to GPT so the model remains the main editorial decision-maker.
+    """
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return "empty_text"
+
+    if _MATERIAL_SIGNAL_RE.search(normalized):
+        return None
+
+    words = re.findall(r"[A-Za-z0-9$%]+", normalized)
+    if _EMPTY_CHATTER_RE.match(normalized):
+        return "empty_chatter"
+
+    if len(words) <= 4:
+        return "too_short_without_market_signal"
+
+    # URL-only / link-dump style posts with no detectable market signal.
+    without_urls = re.sub(r"https?://\S+|www\.\S+", "", normalized, flags=re.IGNORECASE).strip()
+    if not without_urls or len(re.findall(r"[A-Za-z0-9$%]+", without_urls)) <= 2:
+        return "link_only_without_market_signal"
+
+    # Promo-only items are skipped only when no material signal was found above.
+    if _PROMO_ONLY_RE.search(normalized):
+        return "promo_without_market_signal"
+
+    return None
 
 
 # ---------------------------- Main Entry ---------------------------- #
@@ -253,31 +306,37 @@ def analyze_tweet_importance(
         print(f"[DEDUP-WARN] Pre-GPT near-dup check failed for {tweet_id_str}: {e!r}")
         # Fail open: if this check explodes, better to continue than crash.
 
-    # ---------- (5) GPT importance scoring ---------- #
-    score_data = score_tweet_importance(tweet_id_str, username, text)
+    # ---------- (5) Liberal local obvious-junk reject (pre-GPT) ---------- #
+    reject_reason = _local_reject_reason(text)
+    if reject_reason:
+        return {
+            "tweet_id": tweet_id_str,
+            "importance_score": 0,
+            "label": "low",
+            "reason": reject_reason,
+            "headline": None,
+        }
+
+    # ---------- (6) Single-call GPT publish decision + headline generation ---------- #
+    score_data = analyze_tweet_for_publish(tweet_id_str, username, text)
     if score_data is None:
         return _fallback(tweet_id_str, "analysis_failed_no_api_key_or_gpt_error")
 
     score = int(score_data.get("importance_score", 0))
     label = score_data.get("label", "low")
+    reason = score_data.get("reason", "")
 
-    # New rule:
-    # score == 1 -> publish
-    # score == 0 -> do NOT publish
+    # score == 1 -> publish; score == 0 -> do NOT publish
     if score == 0:
         return {
             "tweet_id": tweet_id_str,
             "importance_score": score,
             "label": label,
+            "reason": reason,
             "headline": None,
         }
 
-
-    # ---------- (6) GPT headline generation ---------- #
-    candidate = generate_headline_with_gpt(text)
-    if not candidate:
-        # If GPT fails for some reason, fall back to the local rule-based headline.
-        candidate = candidate_pre
+    candidate = score_data.get("headline") or candidate_pre
 
     # ---------- (7) Post-GPT local near-dup (compressed Jaccard) ---------- #
     # Compare GPT headline against last 100 compressed headlines.
