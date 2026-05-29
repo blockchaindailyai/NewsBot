@@ -51,6 +51,7 @@ Flow summary:
 
 from typing import Dict, Any
 import threading
+import re
 
 from gpt_client import (
     score_tweet_importance,
@@ -96,6 +97,39 @@ load_headline_state()
 load_story_registry()
 
 
+
+
+
+def _core_story_key_from_text(text: str) -> str:
+    """
+    Build a coarse story key directly from raw tweet text to catch
+    same-story posts that use different wording or account-specific prefixes.
+    """
+    if not text:
+        return ""
+
+    cleaned = (text or "").upper()
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    cleaned = re.sub(r"[@#]([A-Z0-9_]+)", r"\1", cleaned)
+    cleaned = re.sub(r"\$([A-Z][A-Z0-9]{1,9})", r"\1", cleaned)
+    cleaned = re.sub(r"[^A-Z0-9\s]", " ", cleaned)
+
+    tokens = re.findall(r"[A-Z0-9]+", cleaned)
+    if not tokens:
+        return ""
+
+    stop = {
+        "BREAKING", "JUST", "IN", "SOURCE", "SOURCES", "REPORT", "REPORTS",
+        "SAYS", "SAY", "RUMOR", "RUMORS", "THREAD", "UPDATE", "NEWS",
+        "THE", "A", "AN", "TO", "FOR", "OF", "AND", "ON", "AT", "BY",
+        "WITH", "FROM", "IS", "ARE", "WAS", "WERE", "AS", "THAT", "THIS",
+    }
+    filtered = [t for t in tokens if t not in stop]
+    if not filtered:
+        filtered = tokens
+
+    # Keep the early semantic spine (order matters) while avoiding very long keys.
+    return " ".join(filtered[:18])
 
 # In-memory story-level dedupe (per process/run).
 _STORY_KEYS: set[str] = set()
