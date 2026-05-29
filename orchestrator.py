@@ -18,7 +18,7 @@ from urllib3.exceptions import ReadTimeoutError
 from auth import ensure_both_profiles_ready
 from analyze import analyze_tweet_importance
 from post_headline import post_headline_with_driver, ComposeUnavailableError
-from scraper import scrape_home_tweets
+from scraper import is_likely_ad_tweet, scrape_home_tweets
 
 from retry_queue import (
     load_retry_queue,
@@ -564,6 +564,12 @@ def run_bot():
                             username = f"@{username}"
 
                         if tid in seen_ids:
+                            continue
+
+                        if is_likely_ad_tweet(username, text):
+                            safe_print(f"[AD-FILTER] Skipping likely ad tweet {tid} from {username} before analysis.")
+                            seen_ids.add(tid)
+                            append_seen_id(tid)
                             continue
 
                         update_signal(username, tweet_id=tid, seen=True)

@@ -4,10 +4,244 @@
 
 import time
 
+from config import (
+    SCRAPER_AD_CTA_PATTERNS,
+    SCRAPER_AD_LABELS,
+    SCRAPER_AD_PROMO_TERMS,
+    SCRAPER_AD_TEXT_PATTERNS,
+    SCRAPER_BLOCK_AD_REQUESTS,
+    SCRAPER_BLOCKED_URL_PATTERNS,
+)
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+
+
+def enable_ad_request_blocking(driver) -> bool:
+    """Enable browser-level ad request blocking via Chrome DevTools Protocol.
+
+    This complements the scraper profile's Chrome ad-block extension by blocking
+    common ad/media/tracking hosts before X has a chance to render those assets.
+    """
+    if not SCRAPER_BLOCK_AD_REQUESTS:
+        return False
+
+    patterns = sorted(SCRAPER_BLOCKED_URL_PATTERNS)
+    if not patterns:
+        return False
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": patterns})
+        return True
+    except Exception as e:
+        print(f"[AD-BLOCK-WARN] Could not enable CDP ad request blocking: {e!r}")
+        return False
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join((value or "").split()).casefold()
+
+
+def _matches_ad_label(value: str) -> bool:
+    normalized = _normalized_text(value)
+    if not normalized:
+        return False
+
+    for raw_label in SCRAPER_AD_LABELS:
+        label = _normalized_text(raw_label)
+        if not label:
+            continue
+        if normalized == label:
+            return True
+        if len(label) > 2 and normalized.startswith(f"{label} "):
+            return True
+        if len(label) <= 2 and normalized.startswith(f"{label} ·"):
+            return True
+        if len(label) <= 2 and normalized.startswith(f"{label} by "):
+            return True
+
+    return False
+
+
+def _contains_phrase(value: str, phrases: set[str]) -> bool:
+    normalized = _normalized_text(value)
+    if not normalized:
+        return False
+    return any(_normalized_text(phrase) in normalized for phrase in phrases if _normalized_text(phrase))
+
+
+def is_likely_ad_tweet(username: str, text: str) -> bool:
+    """Return True for ad-like tweet content that slipped past DOM ad markers."""
+    if _contains_phrase(text, SCRAPER_AD_TEXT_PATTERNS):
+        return True
+
+    normalized = _normalized_text(text)
+    if not normalized:
+        return False
+
+    has_cta = _contains_phrase(normalized, SCRAPER_AD_CTA_PATTERNS)
+    has_promo_term = _contains_phrase(normalized, SCRAPER_AD_PROMO_TERMS)
+    if has_cta and has_promo_term:
+        return True
+
+    # Ads frequently render with an unknown/hidden username when X withholds the
+    # normal author span. Treat strong CTA copy from such cards as low-value ads.
+    return _normalized_text(username) == "@unknown" and has_cta
+
+
+def is_promoted_article(article) -> bool:
+    """Return True when an X timeline article is marked as an ad/promoted post."""
+    try:
+        ad_links = article.find_elements(
+            By.XPATH,
+            ".//a[contains(@href, '/i/ads') or contains(translate(@href, 'PROMOTED', 'promoted'), 'promoted')]",
+        )
+        if ad_links:
+            return True
+    except Exception:
+        pass
+
+    marker_xpaths = (
+        ".//*[@data-testid='socialContext']",
+        ".//*[@aria-label]",
+        ".//*[not(ancestor::*[@data-testid='tweetText']) and (self::span or self::div)][normalize-space()]",
+    )
+
+    for xpath in marker_xpaths:
+        try:
+            candidates = article.find_elements(By.XPATH, xpath)
+        except Exception:
+            continue
+
+        for candidate in candidates:
+            try:
+                if _matches_ad_label(candidate.get_attribute("aria-label") or ""):
+                    return True
+            except Exception:
+                pass
+
+            try:
+                if _matches_ad_label(candidate.text):
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
+AD_BLOCKING_SCRIPT = r"""
+(() => {
+  const labels = new Set((arguments[0] || []).map((value) =>
+    String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+  ).filter(Boolean));
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+  const isAdLabel = (value) => {
+    const normalized = normalize(value);
+    if (!normalized) return false;
+    for (const label of labels) {
+      if (normalized === label) return true;
+      if (label.length > 2 && normalized.startsWith(`${label} `)) return true;
+      if (label.length <= 2 && normalized.startsWith(`${label} ·`)) return true;
+      if (label.length <= 2 && normalized.startsWith(`${label} by `)) return true;
+    }
+    return false;
+  };
+  const markerSelector = [
+    '[data-testid="socialContext"]',
+    '[aria-label]',
+    'a[href*="/i/ads"]',
+    'a[href*="promoted"]',
+    'span',
+    'div'
+  ].join(',');
+  const articleIsPromoted = (article) => {
+    if (!article) return false;
+    for (const link of article.querySelectorAll('a[href]')) {
+      const href = link.getAttribute('href') || '';
+      if (href.includes('/i/ads') || href.toLocaleLowerCase().includes('promoted')) {
+        return true;
+      }
+    }
+    for (const node of article.querySelectorAll(markerSelector)) {
+      if (node.closest('[data-testid="tweetText"]')) continue;
+      if (isAdLabel(node.getAttribute('aria-label')) || isAdLabel(node.textContent)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  const removeMedia = (article) => {
+    for (const media of article.querySelectorAll('video, audio, source, img[src*="/amplify_video/"], [data-testid="videoPlayer"]')) {
+      try {
+        if (typeof media.pause === 'function') media.pause();
+        media.removeAttribute('src');
+        media.load?.();
+        media.remove();
+      } catch (_) {}
+    }
+  };
+  const removeArticle = (article) => {
+    removeMedia(article);
+    article.setAttribute('data-newsbot-ad-removed', 'true');
+    article.style.setProperty('display', 'none', 'important');
+    article.remove();
+  };
+  const prune = (root = document) => {
+    let removed = 0;
+    const articles = [];
+    if (root.matches?.('article')) articles.push(root);
+    for (const article of root.querySelectorAll?.('article') || []) articles.push(article);
+    for (const article of articles) {
+      if (articleIsPromoted(article)) {
+        removeArticle(article);
+        removed += 1;
+      }
+    }
+    return removed;
+  };
+  window.__newsbotPrunePromotedArticles = prune;
+  if (!window.__newsbotPromotedArticleObserver) {
+    let scheduled = false;
+    const schedulePrune = (root = document) => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        prune(root);
+      });
+    };
+    window.__newsbotPromotedArticleObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target?.parentElement;
+        if (targetElement?.closest?.('[data-testid="tweetText"]')) continue;
+        const targetArticle = targetElement?.closest?.('article');
+        if (targetArticle) {
+          schedulePrune(targetArticle);
+          continue;
+        }
+        for (const node of mutation.addedNodes || []) {
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          schedulePrune(node);
+        }
+      }
+    });
+    window.__newsbotPromotedArticleObserver.observe(document.body || document.documentElement, {
+      attributes: true,
+      attributeFilter: ['aria-label', 'href', 'data-testid'],
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    window.__newsbotPromotedArticleInterval = setInterval(() => prune(), 1000);
+  }
+  return prune();
+})();
+"""
 
 
 def extract_text_with_emojis(el):
@@ -15,6 +249,50 @@ def extract_text_with_emojis(el):
         return el.text
     except Exception:
         return ""
+
+
+def install_ad_blocking_script(driver) -> int:
+    """
+    Install an in-page MutationObserver that removes promoted X articles as soon
+    as they appear, preventing ad videos/media from continuing to burn CPU.
+    """
+    try:
+        removed = driver.execute_script(AD_BLOCKING_SCRIPT, sorted(SCRAPER_AD_LABELS))
+        return int(removed or 0)
+    except Exception:
+        return 0
+
+
+def prune_promoted_articles(driver) -> int:
+    """Remove already-rendered promoted articles from the feed."""
+    try:
+        removed = driver.execute_script("return window.__newsbotPrunePromotedArticles?.() || 0;")
+        return int(removed or 0)
+    except Exception:
+        return 0
+
+
+def remove_article(driver, article) -> bool:
+    """Best-effort DOM removal for a promoted article found by Selenium."""
+    try:
+        driver.execute_script(
+            """
+            const article = arguments[0];
+            for (const media of article.querySelectorAll?.('video, audio, source, [data-testid="videoPlayer"]') || []) {
+              try {
+                if (typeof media.pause === 'function') media.pause();
+                media.removeAttribute('src');
+                media.load?.();
+                media.remove();
+              } catch (_) {}
+            }
+            article.remove();
+            """,
+            article,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _js_click(driver, el) -> bool:
@@ -121,12 +399,15 @@ def recover_following_same_page(driver) -> bool:
 
 
 def open_home(driver):
+    enable_ad_request_blocking(driver)
     driver.get("https://x.com/home")
 
     try:
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except TimeoutException:
         pass
+
+    install_ad_blocking_script(driver)
 
     # wait for tablist to exist then settle a bit
     if wait_for_tablist(driver, timeout=6.0):
@@ -141,6 +422,8 @@ def open_home(driver):
         if not ok:
             # Don't skip; we proceed but we log it.
             print("[WARN] Could not confirm 'Following' after recovery; proceeding anyway (guarded scrape).")
+
+    prune_promoted_articles(driver)
 
     # Wait for tweets
     try:
@@ -162,16 +445,23 @@ def scrape_home_tweets(driver):
     if is_tab_selected(driver, foryou_labels) and not is_tab_selected(driver, following_labels):
         ensure_following_selected(driver, timeout=1.8)
 
+    prune_promoted_articles(driver)
+
     tweets = []
     articles = driver.find_elements(By.XPATH, "//section//article")
 
     # GUARD 2: if we still appear to be on For You, do one last quick correction.
     if articles and is_tab_selected(driver, foryou_labels) and not is_tab_selected(driver, following_labels):
         ensure_following_selected(driver, timeout=1.8)
+        prune_promoted_articles(driver)
         articles = driver.find_elements(By.XPATH, "//section//article")
 
     for article in articles:
         try:
+            if is_promoted_article(article):
+                remove_article(driver, article)
+                continue
+
             link = article.find_element(By.XPATH, ".//a[contains(@href, '/status/')]")
             href = link.get_attribute("href") or ""
             if "/status/" not in href:
@@ -196,6 +486,10 @@ def scrape_home_tweets(driver):
 
             text = extract_text_with_emojis(text_div).strip()
             if not text:
+                continue
+
+            if is_likely_ad_tweet(username, text):
+                remove_article(driver, article)
                 continue
 
             tweets.append((tweet_id, username, text))

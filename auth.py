@@ -1,8 +1,9 @@
 # auth.py
-# Scraper = headless(old); Poster = visible off-screen (not minimized), so React sees real input.
+# Scraper = visible by default so Chrome ad-block extensions can run; poster remains visible for React input.
 
 import os
 import time
+from pathlib import Path
 import undetected_chromedriver as uc
 from selenium.common.exceptions import SessionNotCreatedException
 
@@ -14,6 +15,9 @@ from config import (
     POSTER_WINDOW_SIZE,
     POSTER_WINDOW_POS,
     FORCE_CHROME_MAJOR,
+    SCRAPER_AD_BLOCK_EXTENSION_IDS,
+    SCRAPER_AD_BLOCK_EXTENSION_PATHS,
+    SCRAPER_ENABLE_AD_BLOCK_EXTENSION,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -27,6 +31,43 @@ PROFILE_DIR_SCRAPER = os.path.join(os.getcwd(), "x_profile")
 PROFILE_DIR_POSTER  = os.path.join(os.getcwd(), "x_poster_profile")
 
 
+def _find_installed_extension_path(user_data_dir: str, extension_id: str):
+    """Return the newest installed Chrome extension version folder for a profile."""
+    candidates = [
+        Path(user_data_dir) / "Default" / "Extensions" / extension_id,
+        Path(user_data_dir) / "Extensions" / extension_id,
+    ]
+
+    for base in candidates:
+        if not base.is_dir():
+            continue
+
+        versions = [p for p in base.iterdir() if p.is_dir()]
+        if versions:
+            return str(sorted(versions, key=lambda p: p.name, reverse=True)[0].resolve())
+
+    return None
+
+
+def _ad_block_extension_paths(user_data_dir: str) -> list[str]:
+    paths = []
+
+    for raw_path in SCRAPER_AD_BLOCK_EXTENSION_PATHS:
+        path = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+        if path.is_dir():
+            paths.append(str(path.resolve()))
+        else:
+            print(f"[AD-BLOCK] Configured extension path not found: {path}")
+
+    for extension_id in SCRAPER_AD_BLOCK_EXTENSION_IDS:
+        ext_path = _find_installed_extension_path(user_data_dir, extension_id)
+        if ext_path:
+            paths.append(ext_path)
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(paths))
+
+
 def _pick_chrome_binary() -> str:
     """
     Prefer Chrome Beta if installed; otherwise fall back to Stable.
@@ -36,7 +77,7 @@ def _pick_chrome_binary() -> str:
     return CHROME_STABLE_BIN
 
 
-def _make_options(user_data_dir: str, headless: bool, size: str, pos: str) -> uc.ChromeOptions:
+def _make_options(user_data_dir: str, headless: bool, size: str, pos: str, role: str) -> uc.ChromeOptions:
     opts = uc.ChromeOptions()
 
     # ✅ Force which Chrome EXE gets launched (Beta preferred)
@@ -46,8 +87,21 @@ def _make_options(user_data_dir: str, headless: bool, size: str, pos: str) -> uc
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-notifications")
-    opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-popup-blocking")
+
+    if role == "scraper" and SCRAPER_ENABLE_AD_BLOCK_EXTENSION and not headless:
+        extension_paths = _ad_block_extension_paths(user_data_dir)
+        if extension_paths:
+            opts.add_argument(f"--load-extension={','.join(extension_paths)}")
+            print(f"[AD-BLOCK] Loading scraper ad-block extension(s): {', '.join(extension_paths)}")
+        else:
+            print(
+                "[AD-BLOCK] No scraper ad-block extension found. "
+                "Install uBlock Origin/AdBlock in the scraper profile or set "
+                "SCRAPER_AD_BLOCK_EXTENSION_PATHS."
+            )
+    else:
+        opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-features=IsolateOrigins,site-per-process")
     opts.add_argument("--force-device-scale-factor=1")
 
@@ -70,8 +124,8 @@ def _make_options(user_data_dir: str, headless: bool, size: str, pos: str) -> uc
     return opts
 
 
-def _make_driver(user_data_dir: str, headless: bool, size: str, pos: str) -> uc.Chrome:
-    opts = _make_options(user_data_dir, headless, size, pos)
+def _make_driver(user_data_dir: str, headless: bool, size: str, pos: str, role: str) -> uc.Chrome:
+    opts = _make_options(user_data_dir, headless, size, pos, role)
 
     # If a forced major is configured, try it first; if it mismatches installed Chrome,
     # automatically fall back to UC auto-detection to avoid restart loops.
@@ -153,7 +207,7 @@ def _bootstrap_profile(user_data_dir: str, role: str):
         headless = POSTER_HEADLESS if has_cookies else False
         size, pos = POSTER_WINDOW_SIZE, POSTER_WINDOW_POS
 
-    driver = _make_driver(user_data_dir=user_data_dir, headless=headless, size=size, pos=pos)
+    driver = _make_driver(user_data_dir=user_data_dir, headless=headless, size=size, pos=pos, role=role)
 
     # --- Manual login ONLY if there are NO cookies yet ---
     if not has_cookies:
@@ -164,7 +218,7 @@ def _bootstrap_profile(user_data_dir: str, role: str):
                 driver.quit()
             except Exception:
                 pass
-            driver = _make_driver(user_data_dir=user_data_dir, headless=False, size=size, pos=pos)
+            driver = _make_driver(user_data_dir=user_data_dir, headless=False, size=size, pos=pos, role=role)
 
         driver.get("https://x.com/home")
         print("[LOGIN] No cookies found; log in on this window, go to Home (Following is fine), then press Enter here...")

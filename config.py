@@ -29,6 +29,14 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return set(default)
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or set(default)
+
+
 def _get_json_map(name: str) -> dict:
     raw = os.getenv(name)
     if not raw:
@@ -52,6 +60,115 @@ LOOP_SLEEP_SECONDS = _get_int("LOOP_SLEEP_SECONDS", 20)
 ACTIVE_LOOP_SLEEP_SECONDS = _get_int("ACTIVE_LOOP_SLEEP_SECONDS", 5)
 MAX_ANALYSIS_WORKERS = _get_int("MAX_ANALYSIS_WORKERS", 6)
 ANALYSIS_QUEUE_MAXSIZE = _get_int("ANALYSIS_QUEUE_MAXSIZE", 200)
+
+SCRAPER_AD_LABELS = _get_csv_set(
+    "SCRAPER_AD_LABELS",
+    {
+        "Ad",
+        "Promoted",
+        "Sponsored",
+        "광고",
+        "프로모션",
+    },
+)
+
+
+SCRAPER_ENABLE_AD_BLOCK_EXTENSION = _get_bool("SCRAPER_ENABLE_AD_BLOCK_EXTENSION", True)
+SCRAPER_AD_BLOCK_EXTENSION_PATHS = _get_csv_set("SCRAPER_AD_BLOCK_EXTENSION_PATHS", set())
+SCRAPER_AD_BLOCK_EXTENSION_IDS = _get_csv_set(
+    "SCRAPER_AD_BLOCK_EXTENSION_IDS",
+    {
+        # uBlock Origin, uBlock Origin Lite, AdBlock, Adblock Plus
+        "cjpalhdlnbpafiamejdnhcphjbkeiagm",
+        "ddkjiahejlhfcafbddmgiahcphecmpfh",
+        "gighmmpiobklfepjocnamgkkbiglidom",
+        "cfhdojbkjhnklbpkdaibdccddilifddb",
+    },
+)
+
+SCRAPER_BLOCK_AD_REQUESTS = _get_bool("SCRAPER_BLOCK_AD_REQUESTS", True)
+SCRAPER_BLOCKED_URL_PATTERNS = _get_csv_set(
+    "SCRAPER_BLOCKED_URL_PATTERNS",
+    {
+        "*://*.adnxs.com/*",
+        "*://*.ads-twitter.com/*",
+        "*://ads-twitter.com/*",
+        "*://*.adsrvr.org/*",
+        "*://*.amazon-adsystem.com/*",
+        "*://*.doubleclick.net/*",
+        "*://*.googleadservices.com/*",
+        "*://*.googlesyndication.com/*",
+        "*://*.moatads.com/*",
+        "*://*.outbrain.com/*",
+        "*://*.scorecardresearch.com/*",
+        "*://*.taboola.com/*",
+        "*://*.twitter.com/i/ads/*",
+        "*://twitter.com/i/ads/*",
+        "*://*.x.com/i/ads/*",
+        "*://x.com/i/ads/*",
+    },
+)
+SCRAPER_AD_TEXT_PATTERNS = _get_csv_set(
+    "SCRAPER_AD_TEXT_PATTERNS",
+    {
+        "sponsored promotion",
+        "sponsored post",
+        "sign up for our free",
+        "sign up for a free trial",
+        "try for free",
+        "book a demo",
+        "claim free",
+        "play free & win",
+        "start trading",
+        "open an account",
+        "limited time only",
+        "register for free",
+        "free ai newsletter",
+        "free credits",
+        "free investing webcast",
+        "free stake cash",
+        "free version",
+        "access a lite version",
+        "register for the free",
+        "limited time when you register",
+    },
+)
+SCRAPER_AD_CTA_PATTERNS = _get_csv_set(
+    "SCRAPER_AD_CTA_PATTERNS",
+    {
+        "book a demo",
+        "download our",
+        "download the guide",
+        "download the report",
+        "get more info",
+        "grab your tickets",
+        "join now",
+        "learn more",
+        "open an account",
+        "register",
+        "sign up",
+        "start trading",
+        "subscribe",
+        "try for free",
+    },
+)
+SCRAPER_AD_PROMO_TERMS = _get_csv_set(
+    "SCRAPER_AD_PROMO_TERMS",
+    {
+        "casino",
+        "credits",
+        "demo",
+        "free trial",
+        "free webinar",
+        "newsletter",
+        "promotion",
+        "sponsored",
+        "stake cash",
+        "tickets",
+        "webcast",
+        "webinar",
+    },
+)
 
 STORY_REGISTRY_PATH = os.getenv("STORY_REGISTRY_PATH", "story_registry.jsonl")
 DEDUPE_AUDIT_PATH = os.getenv("DEDUPE_AUDIT_PATH", "dedupe_audit.jsonl")
