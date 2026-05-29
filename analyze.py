@@ -324,15 +324,12 @@ def analyze_tweet_importance(
 
     score = int(score_data.get("importance_score", 0))
     label = score_data.get("label", "low")
-    reason = score_data.get("reason", "")
-
     # score == 1 -> publish; score == 0 -> do NOT publish
     if score == 0:
         return {
             "tweet_id": tweet_id_str,
             "importance_score": score,
             "label": label,
-            "reason": reason,
             "headline": None,
         }
 

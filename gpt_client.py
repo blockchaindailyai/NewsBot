@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import time
 import random
 import logging
@@ -154,26 +153,25 @@ def _normalize_generated_headline(headline: str) -> Optional[str]:
     return headline[:270].strip() or None
 
 
-def _json_from_response(raw: str) -> dict:
-    raw = (raw or "").strip()
-    if not raw:
-        return {}
+def _parse_publish_response(raw: str) -> tuple[int, Optional[str]]:
+    """Parse compact publish response: 0 or 1|headline."""
+    value = (raw or "").strip()
+    if not value:
+        return 0, None
 
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        pass
+    first = value[0]
+    if first == "0":
+        return 0, None
+    if first != "1":
+        return 0, None
 
-    # Be forgiving if the model wraps the JSON in prose or a code fence.
-    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if not m:
-        return {}
-    try:
-        parsed = json.loads(m.group(0))
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        return {}
+    remainder = value[1:].lstrip()
+    if remainder.startswith("|"):
+        remainder = remainder[1:].strip()
+
+    headline = _normalize_generated_headline(remainder) if remainder else None
+    return 1, headline
+
 
 
 def analyze_tweet_for_publish(tweet_id: str, username: str, text: str) -> Optional[dict]:
@@ -187,14 +185,11 @@ def analyze_tweet_for_publish(tweet_id: str, username: str, text: str) -> Option
     system_prompt = r"""
 You are an experienced financial news editor for a real-time crypto + US-macro newswire.
 
-Return ONLY valid JSON with this exact shape:
-{
-  "publish": 0 or 1,
-  "headline": null or "🚨 ALL-CAPS HEADLINE",
-  "reason": "very short internal reason"
-}
+Return ONLY one of these compact formats:
+0
+1|🚨 ALL-CAPS HEADLINE
 
-DEFAULT = publish 0. Only a small minority of tweets should ever be publish 1.
+DEFAULT = 0. Only a small minority of tweets should ever be 1.
 
 Publish only when the tweet clearly describes a concrete, market-relevant event involving at least one of:
 - major crypto assets/tickers, exchanges, issuers, regulators, or well-known crypto companies
@@ -204,7 +199,7 @@ Publish only when the tweet clearly describes a concrete, market-relevant event 
 
 Always publish 0 for routine commentary, memes, vague opinions, promos, Spaces/AMAs/watch-live posts with no substance, stale/ICYMI resharing, non-US routine data, and price chatter without a concrete percent/move/event.
 
-If publish is 1, headline rules:
+If returning 1, headline rules:
 - Prefix with exactly one 🚨.
 - Uppercase English.
 - Keep under 140 characters when possible.
@@ -215,7 +210,7 @@ If publish is 1, headline rules:
 - Capture the entity, action, and impact.
 - Do not include links; if a domain is necessary, write it like BITCOIN(.)COM.
 
-If publish is 0, headline must be null.
+If returning 0, return exactly 0 with no reason or explanation.
 """.strip()
 
     user_prompt = f"""
@@ -237,10 +232,7 @@ Handle: {username}
             return None
 
         raw = (resp.choices[0].message.content or "").strip()
-        parsed = _json_from_response(raw)
-        publish_raw = parsed.get("publish", 0)
-        publish = 1 if str(publish_raw).strip().lower() in {"1", "true", "yes"} else 0
-        headline = _normalize_generated_headline(parsed.get("headline") or "") if publish else None
+        publish, headline = _parse_publish_response(raw)
 
         # If the model marked publish but omitted a headline, let the caller use
         # its deterministic fallback rather than spending another model round-trip.
@@ -249,7 +241,6 @@ Handle: {username}
             "importance_score": publish,
             "label": "high" if publish else "low",
             "headline": headline,
-            "reason": str(parsed.get("reason") or "").strip(),
         }
     except Exception as e:
         print(f"[GPT-ERROR] analyze_tweet_for_publish failed for {tweet_id}: {e}")
