@@ -57,6 +57,42 @@ def _find_first(driver: WebDriver, selectors: list[str]) -> Optional[object]:
     return None
 
 
+def _find_ready_compose_editor(driver: WebDriver) -> Optional[object]:
+    """Return an already-open, hydrated compose editor if one is available."""
+    try:
+        editor = driver.execute_script("""
+            const dialog = document.querySelector('[role="dialog"]');
+            if (!dialog) return null;
+
+            const ed =
+                dialog.querySelector('div[data-testid="tweetTextarea_0"] [contenteditable="true"]') ||
+                dialog.querySelector('div[data-testid="tweetTextarea_0"]') ||
+                dialog.querySelector('[contenteditable="true"]');
+
+            if (!ed) return null;
+
+            const keys = Object.keys(ed);
+            const hydrated = keys.some(
+                k => k.startsWith('__reactProps') || k.startsWith('__reactFiber')
+            );
+
+            return hydrated ? ed : null;
+        """)
+    except Exception:
+        editor = None
+
+    if not editor:
+        editor = _find_first(driver, EDITOR_SELECTORS)
+
+    if editor:
+        try:
+            driver.execute_script("arguments[0].focus();", editor)
+        except Exception:
+            pass
+
+    return editor
+
+
 def _sanitize_ascii(text: str) -> str:
     if not text:
         return ""
@@ -148,38 +184,8 @@ def _get_compose_editor_with_retries(
         deadline = time.time() + PER_ATTEMPT_WAIT
 
         while time.time() < deadline:
-            # Primary: JS-assisted editor detection that ONLY returns a hydrated React editor
-            try:
-                editor = driver.execute_script("""
-                    const dialog = document.querySelector('[role="dialog"]');
-                    if (!dialog) return null;
-
-                    const ed =
-                        dialog.querySelector('div[data-testid="tweetTextarea_0"] [contenteditable="true"]') ||
-                        dialog.querySelector('div[data-testid="tweetTextarea_0"]') ||
-                        dialog.querySelector('[contenteditable="true"]');
-
-                    if (!ed) return null;
-
-                    const keys = Object.keys(ed);
-                    const hydrated = keys.some(
-                        k => k.startsWith('__reactProps') || k.startsWith('__reactFiber')
-                    );
-
-                    return hydrated ? ed : null;
-                """)
-            except Exception:
-                editor = None
-
-            # Secondary: CSS-based fallback (in case React-prop detection fails for some reason)
-            if not editor:
-                editor = _find_first(driver, EDITOR_SELECTORS)
-
+            editor = _find_ready_compose_editor(driver)
             if editor:
-                try:
-                    driver.execute_script("arguments[0].focus();", editor)
-                except Exception:
-                    pass
                 #print(f"[POST] Found compose editor on attempt {attempt}/{max_attempts}.")   #### OFF
                 return editor
 
@@ -194,6 +200,26 @@ def _get_compose_editor_with_retries(
     return None
 
 
+def warm_compose_driver(driver: WebDriver) -> bool:
+    """
+    Best-effort preloader for the next post.
+
+    Opens compose and verifies the hydrated editor while the poster is idle so
+    the next headline can skip most navigation/hydration latency.
+    """
+    if _find_ready_compose_editor(driver):
+        return True
+
+    try:
+        editor = _get_compose_editor_with_retries(driver, max_attempts=1, delay_between=0.0)
+        return editor is not None
+    except ComposeUnavailableError:
+        raise
+    except Exception as e:
+        print(f"[POST] Warm compose failed: {e}")
+        return False
+
+
 def _single_post_attempt(driver: WebDriver, txt: str) -> bool:
     """
     ONE full attempt:
@@ -205,7 +231,7 @@ def _single_post_attempt(driver: WebDriver, txt: str) -> bool:
 
     May raise ComposeUnavailableError if compose cannot be opened.
     """
-    editor = _get_compose_editor_with_retries(driver, max_attempts=6, delay_between=1.0)
+    editor = _find_ready_compose_editor(driver) or _get_compose_editor_with_retries(driver, max_attempts=6, delay_between=1.0)
     if not editor:
         print("[POST] Could not find compose editor after multiple attempts.")
         return False

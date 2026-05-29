@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import time
 import random
 import logging
@@ -22,6 +21,24 @@ if not API_KEY:
 client = OpenAI(api_key=API_KEY) if API_KEY else None
 logger = logging.getLogger("gpt_client")
 _failure_until = 0.0
+
+_DEDUPE_TOP_N = 25
+_DEDUPE_GPT_MIN_SCORE = 0.20
+_DEDUPE_CONTEXT_MAX_CHARS = 260
+
+_DEDUPE_ACTION_TERMS = {
+    "APPROVE", "APPROVES", "APPROVED", "FILE", "FILES", "FILED",
+    "LAUNCH", "LAUNCHES", "LAUNCHED", "LIST", "LISTS", "LISTED",
+    "HALT", "HALTS", "HALTED", "HACK", "HACKED", "EXPLOIT", "EXPLOITED",
+    "SUE", "SUES", "SUED", "CHARGE", "CHARGES", "CHARGED",
+    "SETTLE", "SETTLES", "SETTLED", "BUY", "BUYS", "BOUGHT",
+    "SELL", "SELLS", "SOLD", "ACQUIRE", "ACQUIRES", "ACQUIRED",
+    "PARTNER", "PARTNERS", "PARTNERED", "RAISE", "RAISES", "RAISED",
+    "CUT", "CUTS", "HIKE", "HIKES", "BEAT", "BEATS", "MISS", "MISSES",
+    "FALL", "FALLS", "RISE", "RISES", "JUMP", "JUMPS", "DROP", "DROPS",
+    "MINT", "MINTS", "BURN", "BURNS", "TRANSFER", "TRANSFERS",
+    "OUTAGE", "DEPEG", "DEFAULT", "BANKRUPTCY", "INVEST", "INVESTS",
+}
 
 
 def _chat_completion_with_retry(**kwargs):
@@ -49,6 +66,185 @@ def _token_set(text: str) -> set[str]:
     Uppercases and keeps only [A-Z0-9]+ chunks.
     """
     return set(re.findall(r"[A-Z0-9]+", (text or "").upper()))
+
+
+def _dedupe_score(
+    cand_tokens: set[str],
+    headline_tokens: set[str],
+    candidate_fp: StoryFingerprint,
+) -> float:
+    """Rank prior headlines by same-story risk before spending GPT tokens."""
+    if not cand_tokens or not headline_tokens:
+        return 0.0
+
+    shared = cand_tokens & headline_tokens
+    union = cand_tokens | headline_tokens
+    jacc = len(shared) / len(union) if union else 0.0
+    score = jacc
+
+    if shared & _DEDUPE_ACTION_TERMS:
+        score += 0.12
+
+    if any(re.search(r"\d", tok) for tok in shared):
+        score += 0.10
+
+    fp_tokens = _token_set(candidate_fp.entity_action_key)
+    if fp_tokens and shared & fp_tokens:
+        score += min(0.12, 0.03 * len(shared & fp_tokens))
+
+    return score
+
+
+def _dedupe_context_excerpt(tweet_text: str) -> str:
+    """Return a compact source excerpt only for ambiguous dedupe prompts."""
+    cleaned = re.sub(r"https?://\S+|www\.\S+", " ", tweet_text or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= _DEDUPE_CONTEXT_MAX_CHARS:
+        return cleaned
+    return cleaned[: _DEDUPE_CONTEXT_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _should_include_dedupe_context(compressed_candidate: str, cand_tokens: set[str]) -> bool:
+    """Avoid sending full tweet text unless the headline is too sparse to compare."""
+    if len(cand_tokens) < 6:
+        return True
+    has_action = bool(cand_tokens & _DEDUPE_ACTION_TERMS)
+    has_number = any(re.search(r"\d", tok) for tok in cand_tokens)
+    if not has_action and not has_number:
+        return True
+    return len(compressed_candidate or "") < 45
+
+
+def _normalize_generated_headline(headline: str) -> Optional[str]:
+    if not headline:
+        return None
+
+    headline = str(headline).strip()
+
+    # Try to extract the first line that begins with the alert emoji.
+    m = re.search(r"(🚨[^\n\r]*)", headline)
+    if m:
+        headline = m.group(1).strip()
+
+    if not headline:
+        return None
+
+    # Ensure a single leading 🚨.
+    if not headline.startswith("🚨"):
+        headline = f"🚨 {headline}"
+
+    # Strip BREAKING/#BREAKING immediately after the emoji; the account name
+    # already signals urgency and this avoids repetitive spam-like wording.
+    headline = re.sub(
+        r"^🚨\s*#?BREAKING[:\-\s]*\s*",
+        "🚨 ",
+        headline,
+        flags=re.IGNORECASE,
+    )
+
+    headline = re.sub(r"\s+", " ", headline).strip()
+
+    if headline.startswith("🚨"):
+        rest = headline[1:].strip()
+        headline = f"🚨 {rest.upper()}"
+    else:
+        headline = headline.upper()
+
+    return headline[:270].strip() or None
+
+
+def _parse_publish_response(raw: str) -> tuple[int, Optional[str]]:
+    """Parse compact publish response: 0 or 1|headline."""
+    value = (raw or "").strip()
+    if not value:
+        return 0, None
+
+    first = value[0]
+    if first == "0":
+        return 0, None
+    if first != "1":
+        return 0, None
+
+    remainder = value[1:].lstrip()
+    if remainder.startswith("|"):
+        remainder = remainder[1:].strip()
+
+    headline = _normalize_generated_headline(remainder) if remainder else None
+    return 1, headline
+
+
+
+def analyze_tweet_for_publish(tweet_id: str, username: str, text: str) -> Optional[dict]:
+    """
+    Single-call GPT path: decide whether to publish and, if so, draft the
+    publishable headline in the same response.
+    """
+    if client is None:
+        return None
+
+    system_prompt = r"""
+You are an experienced financial news editor for a real-time crypto + US-macro newswire.
+
+Return ONLY one of these compact formats:
+0
+1|🚨 ALL-CAPS HEADLINE
+
+DEFAULT = 0. Only a small minority of tweets should ever be 1.
+
+Publish only when the tweet clearly describes a concrete, market-relevant event involving at least one of:
+- major crypto assets/tickers, exchanges, issuers, regulators, or well-known crypto companies
+- US macro data/policy (CPI, PPI, PCE, NFP, GDP, jobless claims, Fed/FOMC/Treasury, rates, tariffs)
+- major US megacap equities or clearly market-moving finance events
+- major geopolitical escalations that are truly market moving
+
+Always publish 0 for routine commentary, memes, vague opinions, promos, Spaces/AMAs/watch-live posts with no substance, stale/ICYMI resharing, non-US routine data, and price chatter without a concrete percent/move/event.
+
+If returning 1, headline rules:
+- Prefix with exactly one 🚨.
+- Uppercase English.
+- Keep under 140 characters when possible.
+- Do NOT include BREAKING or #BREAKING.
+- No hashtags except cashtags like $BTC or $AAPL.
+- Do not include @ handles unless the handle is itself the story.
+- Never invent facts; use only what the tweet explicitly says.
+- Capture the entity, action, and impact.
+- Do not include links; if a domain is necessary, write it like BITCOIN(.)COM.
+
+If returning 0, return exactly 0 with no reason or explanation.
+""".strip()
+
+    user_prompt = f"""
+Tweet text:
+{text}
+
+Handle: {username}
+""".strip()
+
+    try:
+        resp = _chat_completion_with_retry(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": system_prompt, "cache": True},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        if resp is None:
+            return None
+
+        raw = (resp.choices[0].message.content or "").strip()
+        publish, headline = _parse_publish_response(raw)
+
+        # If the model marked publish but omitted a headline, let the caller use
+        # its deterministic fallback rather than spending another model round-trip.
+        return {
+            "tweet_id": str(tweet_id),
+            "importance_score": publish,
+            "label": "high" if publish else "low",
+            "headline": headline,
+        }
+    except Exception as e:
+        print(f"[GPT-ERROR] analyze_tweet_for_publish failed for {tweet_id}: {e}")
+        return None
 
 
 def score_tweet_importance(tweet_id: str, username: str, text: str) -> Optional[dict]:
@@ -285,39 +481,7 @@ TWEET TEXT:
         if resp is None:
             return None
 
-        headline = (resp.choices[0].message.content or "").strip()
-
-        # Try to extract the first line that begins with the alert emoji.
-        m = re.search(r"(🚨[^\n\r]*)", headline)
-        if m:
-            headline = m.group(1).strip()
-        else:
-            headline = headline.strip()
-
-        # Ensure a single leading 🚨
-        if not headline.startswith("🚨"):
-            headline = f"🚨 {headline}"
-
-        # Strip any BREAKING/#BREAKING token that might still appear
-        # immediately after the emoji (for safety against cached behavior).
-        headline = re.sub(
-            r"^🚨\s*#?BREAKING[:\-\s]*\s*",
-            "🚨 ",
-            headline,
-            flags=re.IGNORECASE,
-        )
-
-        # Collapse whitespace
-        headline = re.sub(r"\s+", " ", headline).strip()
-
-        # Keep the emoji as-is, uppercase the rest
-        if headline.startswith("🚨"):
-            rest = headline[1:].strip()
-            headline = f"🚨 {rest.upper()}"
-        else:
-            headline = headline.upper()
-
-        return headline
+        return _normalize_generated_headline(resp.choices[0].message.content or "")
     except Exception as e:
         print(f"[GPT-HEADLINE-ERROR] {e}")
         return None
@@ -335,7 +499,9 @@ def gpt_is_duplicate(
     as any of the last N compressed headlines.
 
     To reduce token usage:
-      - We prefilter by simple keyword overlap.
+      - We prefilter and rank by local same-story signals.
+      - We send only the strongest compressed-headline shortlist.
+      - We include source tweet context only for sparse/ambiguous candidates.
       - We ask GPT to return ONLY a single character:
             '1' = duplicate
             '0' = not duplicate
@@ -374,20 +540,19 @@ def gpt_is_duplicate(
         # - at least 2 shared tokens OR
         # - Jaccard similarity above a small threshold.
         if inter >= 2 or jacc >= 0.18:
-            scored.append((jacc, h))
+            scored.append((_dedupe_score(cand_tokens, h_tokens, candidate_fp), h))
 
     if not scored:
         # No prior headlines share meaningful keywords → very unlikely to be a dup.
         return False
 
-    # Keep only top-N most similar to keep prompts short.
+    # Keep only the strongest same-story risks to keep prompts short. The GPT call
+    # is a final adjudicator, not the broad search layer.
     scored.sort(key=lambda x: x[0], reverse=True)
+    if scored[0][0] < _DEDUPE_GPT_MIN_SCORE:
+        return False
 
-    # Allow up to 100 most-similar headlines to be sent to GPT.
-    # (Caller may pass the full compressed history; we slice here.)
-    TOP_N = 100
-    filtered_headlines = [h for _, h in scored[:TOP_N]]
-
+    filtered_headlines = [h for _, h in scored[:_DEDUPE_TOP_N]]
 
     numbered = "\n".join(
         f"{idx + 1}. {h}"
@@ -410,16 +575,19 @@ def gpt_is_duplicate(
         "No explanation. No JSON. No extra text."
     )
 
+    source_context = ""
+    if _should_include_dedupe_context(compressed_candidate, cand_tokens):
+        excerpt = _dedupe_context_excerpt(tweet_text)
+        if excerpt:
+            source_context = f'\nSource context excerpt, for disambiguation only:\n"{excerpt}"\n'
+
     user_prompt = f"""
 Recent compressed headlines (most recent first):
 {numbered}
 
 Candidate compressed headline:
 "{compressed_candidate}"
-
-Full tweet text for context:
-"{tweet_text}"
-
+{source_context}
 Is the candidate essentially the SAME underlying story as any of the recent headlines?
 
 Reply with ONLY:

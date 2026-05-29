@@ -235,7 +235,19 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
       3) Repeat until STOP_EVENT is set and there is no more work.
     """
     last_retry_check = 0.0
+    last_compose_warm = 0.0
     compose_backoff_until = 0.0  # when > now, temporarily stop trying to post
+
+    try:
+        if warm_compose_driver(poster_driver):
+            last_compose_warm = time.time()
+            if DEBUG_QUEUE_LOGS:
+                safe_print("[POST] Compose warmed for first post.")
+    except ComposeUnavailableError as e:
+        safe_print(f"[POST] Initial compose warm unavailable: {e!r}")
+        compose_backoff_until = time.time() + 15
+    except Exception as e:
+        safe_print(f"[POST] Initial compose warm failed: {e!r}")
 
     while True:
         # Global shutdown: stop once requested AND there is no more work.
@@ -243,6 +255,8 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
             break
 
         now = time.time()
+        if compose_backoff_until and now >= compose_backoff_until:
+            compose_backoff_until = 0.0
 
         # 1) Periodic retry queue processing
         if retry_queue and (now - last_retry_check >= RETRY_CHECK_INTERVAL):
@@ -288,6 +302,21 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
         try:
             item = post_queue.get(timeout=2.0)
         except Empty:
+            if (
+                not retry_queue
+                and not compose_backoff_until
+                and time.time() - last_compose_warm >= 60
+            ):
+                try:
+                    if warm_compose_driver(poster_driver):
+                        last_compose_warm = time.time()
+                        if DEBUG_QUEUE_LOGS:
+                            safe_print("[POST] Compose kept warm while idle.")
+                except ComposeUnavailableError as e:
+                    safe_print(f"[POST] Idle compose warm unavailable: {e!r}")
+                    compose_backoff_until = time.time() + 15
+                except Exception as e:
+                    safe_print(f"[POST] Idle compose warm failed: {e!r}")
             continue
 
         tweet_id = item.get("tweet_id")
@@ -311,6 +340,17 @@ def post_sender_loop(poster_driver, post_queue: Queue, retry_queue):
         try:
             post_result = post_headline_with_driver(poster_driver, headline)
             safe_print(f"[POST] {'Success' if post_result else 'Failed'} -> {headline}")
+            if post_result:
+                try:
+                    if warm_compose_driver(poster_driver):
+                        last_compose_warm = time.time()
+                        if DEBUG_QUEUE_LOGS:
+                            safe_print("[POST] Compose rewarmed after successful post.")
+                except ComposeUnavailableError as e:
+                    safe_print(f"[POST] Compose unavailable while rewarming after {tweet_id}: {e!r}")
+                    compose_backoff_until = time.time() + 15
+                except Exception as e:
+                    safe_print(f"[POST] Compose rewarm failed after {tweet_id}: {e!r}")
 
         except ComposeUnavailableError as e:
             post_result = False
