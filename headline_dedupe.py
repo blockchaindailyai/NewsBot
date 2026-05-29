@@ -3,7 +3,7 @@ import re
 
 from headline_store import get_all_compressed_headlines
 from headline_compress import compress_headline_local
-from story_dedupe import build_story_fingerprint
+from story_dedupe import StoryFingerprint, build_story_fingerprint
 
 
 _RECURRING_HISTORY_TERMS = {
@@ -25,8 +25,12 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
-def _is_recurring_candidate(candidate_headline: str, tweet_text: str = "") -> bool:
-    fp = build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
+def _is_recurring_candidate(
+    candidate_headline: str,
+    tweet_text: str = "",
+    story_fp: StoryFingerprint | None = None,
+) -> bool:
+    fp = story_fp or build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
     return fp.is_recurring or bool(_token_set(candidate_headline) & _RECURRING_HISTORY_TERMS)
 
 
@@ -36,6 +40,7 @@ def is_local_duplicate(
     *,
     tweet_text: str = "",
     allow_recurring_history: bool = False,
+    story_fp: StoryFingerprint | None = None,
 ) -> bool:
     """
     Compare a candidate headline against compressed headline history.
@@ -46,7 +51,7 @@ def is_local_duplicate(
     be eligible to post unless an explicit period-aware duplicate layer proves
     they are the same release.
     """
-    if not allow_recurring_history and _is_recurring_candidate(candidate_headline, tweet_text):
+    if not allow_recurring_history and _is_recurring_candidate(candidate_headline, tweet_text, story_fp):
         return False
 
     last = get_all_compressed_headlines()

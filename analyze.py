@@ -66,7 +66,12 @@ from headline_store import (
 
 from headline_dedupe import is_local_duplicate
 from local_headline_fallback import generate_blockchain_daily_headline
-from story_dedupe import build_story_fingerprint
+from story_dedupe import StoryFingerprint, build_story_fingerprint
+from story_registry import (
+    has_historical_duplicate,
+    load_story_registry,
+    save_story_record,
+)
 
 
 # ---------------------------- Fallback ---------------------------- #
@@ -86,6 +91,7 @@ def _fallback(tweet_id: str, reason: str) -> Dict[str, Any]:
 
 # Load existing headline state from disk (full + compressed).
 load_headline_state()
+load_story_registry()
 
 
 
@@ -116,7 +122,7 @@ def _claim_story_slot(story_keys: tuple[str, ...]) -> bool:
 # ---------------------------- Main Entry ---------------------------- #
 
 
-def analyze_tweet_importance(tweet_id, username, text):
+def analyze_tweet_importance(tweet_id, username, text, story_fp: StoryFingerprint | None = None):
     """
     Analyze a tweet's importance for a crypto/news bot and optionally
     produce a headline.
@@ -135,15 +141,15 @@ def analyze_tweet_importance(tweet_id, username, text):
     tweet_id_str = str(tweet_id)
 
     # ---------- (1) Local fallback headline + high-precision fingerprint (no GPT) ---------- #
-    story_fp = build_story_fingerprint(text)
+    story_fp = story_fp or build_story_fingerprint(text)
     candidate_pre = story_fp.fallback_headline or generate_blockchain_daily_headline(text)
 
-    # ---------- (2) Disk-based exact dedupe (pre-GPT) ---------- #
-    # Recurring scheduled data is allowed through unless the period is explicit;
-    # otherwise this month's release can look identical to a much older release.
+    # ---------- (2) Structured + legacy exact historical dedupe (pre-GPT) ---------- #
+    # Structured registry checks are period-aware. Legacy exact headline checks are
+    # only used where they cannot suppress a recurring story without a period.
     try:
         can_use_exact_history = (not story_fp.is_recurring) or bool(story_fp.period_key)
-        if can_use_exact_history and seen_full_preapi(candidate_pre):
+        if has_historical_duplicate(story_fp) or (can_use_exact_history and seen_full_preapi(candidate_pre)):
             # Story already covered in prior runs.
             return {
                 "tweet_id": tweet_id_str,
@@ -179,7 +185,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # very similar to a recent compressed headline on disk.
     # This saves tokens across runs when the same story keeps circulating.
     try:
-        if is_local_duplicate(candidate_pre, threshold=0.78, tweet_text=text):
+        if is_local_duplicate(candidate_pre, threshold=0.78, tweet_text=text, story_fp=story_fp):
             # Very similar to a recent story; we consider it already covered.
             return {
                 "tweet_id": tweet_id_str,
@@ -220,7 +226,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # ---------- (7) Post-GPT local near-dup (compressed Jaccard) ---------- #
     # Compare GPT headline against last 100 compressed headlines.
     try:
-        if is_local_duplicate(candidate, threshold=0.82, tweet_text=text):
+        if is_local_duplicate(candidate, threshold=0.82, tweet_text=text, story_fp=story_fp):
             return {
                 "tweet_id": tweet_id_str,
                 "importance_score": score,
@@ -235,7 +241,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # prefilter and pass at most ~100 most-similar items into the prompt.
     recent_compressed = get_all_compressed_headlines()
     try:
-        if gpt_is_duplicate(candidate, text, recent_compressed):
+        if gpt_is_duplicate(candidate, text, recent_compressed, story_fp=story_fp):
             return {
                 "tweet_id": tweet_id_str,
                 "importance_score": score,
@@ -249,6 +255,12 @@ def analyze_tweet_importance(tweet_id, username, text):
     # Save full headline (and compressed variant) if it's truly new.
     try:
         if save_full_headline(candidate, allow_duplicate_key=story_fp.is_recurring):
+            save_story_record(
+                headline=candidate,
+                fingerprint=story_fp,
+                tweet_id=tweet_id_str,
+                username=username,
+            )
             return {
                 "tweet_id": tweet_id_str,
                 "importance_score": score,

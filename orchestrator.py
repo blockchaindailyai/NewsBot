@@ -149,7 +149,7 @@ def input_listener():
             break
 
 
-def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue):
+def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=None):
     """
     Per-tweet analysis worker.
 
@@ -159,7 +159,7 @@ def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue):
     - If a new headline is found, enqueue it for the post_sender thread.
     """
     try:
-        analysis = analyze_tweet_importance(tweet_id, username, text)
+        analysis = analyze_tweet_importance(tweet_id, username, text, story_fp=story_fp)
     except Exception as e:
         safe_print(f"[ERROR] Failed analyzing tweet {tweet_id}: {e!r}")
         return
@@ -390,14 +390,12 @@ def _prefilter_unique_stories_batch(tweets):
     """
     Group one scraped batch into likely-unique stories before GPT analysis.
 
-    This stage is intentionally high precision and batch-local:
-      - It catches near-simultaneous duplicate posts from multiple accounts.
-      - It chooses the richest representative tweet from each duplicate group.
-      - It does NOT suppress recurring stories merely because older history looks
-        similar (for example April CPI vs May CPI). Historical dedupe remains in
-        analyze.py, where recurring-data safeguards are applied.
+    CPU note: batches are small (~10-15 tweets), but this still uses direct key
+    indexes first and only falls back to pairwise similarity for ambiguous cases.
+    It returns the representative fingerprint so analysis does not rebuild it.
     """
     groups = []
+    key_to_group = {}
 
     for tid, username, text in tweets:
         try:
@@ -407,22 +405,37 @@ def _prefilter_unique_stories_batch(tweets):
             groups.append({
                 "items": [(tid, username, text, None)],
                 "representative": (tid, username, text, None),
+                "keys": set(),
             })
             continue
 
+        keys = set(fingerprint.batch_keys)
         matched_group = None
-        for group in groups:
-            rep_fp = group["representative"][3]
-            if rep_fp is not None and likely_same_batch_story(fingerprint, rep_fp):
-                matched_group = group
+
+        for key in keys:
+            matched_group = key_to_group.get(key)
+            if matched_group is not None:
                 break
+
+        if matched_group is None:
+            for group in groups:
+                rep_fp = group["representative"][3]
+                if rep_fp is not None and likely_same_batch_story(fingerprint, rep_fp):
+                    matched_group = group
+                    break
 
         item = (tid, username, text, fingerprint)
         if matched_group is None:
-            groups.append({"items": [item], "representative": item})
+            group = {"items": [item], "representative": item, "keys": keys}
+            groups.append(group)
+            for key in keys:
+                key_to_group[key] = group
             continue
 
         matched_group["items"].append(item)
+        matched_group["keys"].update(keys)
+        for key in keys:
+            key_to_group[key] = matched_group
 
         current = matched_group["representative"]
         current_score = representative_score(current[1], current[2], current[3])
@@ -432,8 +445,8 @@ def _prefilter_unique_stories_batch(tweets):
 
     unique = []
     for group in groups:
-        rep_tid, rep_username, rep_text, _ = group["representative"]
-        unique.append((rep_tid, rep_username, rep_text))
+        rep_tid, rep_username, rep_text, rep_fp = group["representative"]
+        unique.append((rep_tid, rep_username, rep_text, rep_fp))
 
         if DEBUG_QUEUE_LOGS and len(group["items"]) > 1:
             skipped = [tid for tid, _, _, _ in group["items"] if tid != rep_tid]
@@ -543,7 +556,7 @@ def run_bot():
 
                 unique_candidates = _prefilter_unique_stories_batch(batch_candidates)
 
-                for tid, username, text in unique_candidates:
+                for tid, username, text, story_fp in unique_candidates:
                     try:
                         _trim_done_futures(analysis_futures)
                         if len(analysis_futures) >= max(1, ANALYSIS_QUEUE_MAXSIZE):
@@ -556,6 +569,7 @@ def run_bot():
                             username,
                             text,
                             post_queue,
+                            story_fp,
                         )
                         fut.add_done_callback(_log_analysis_future_error)
                         analysis_futures.add(fut)

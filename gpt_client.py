@@ -8,7 +8,7 @@ from typing import Optional
 
 from openai import OpenAI
 from headline_compress import compress_headline_local
-from story_dedupe import build_story_fingerprint
+from story_dedupe import StoryFingerprint, build_story_fingerprint
 from config import (
     OPENAI_TIMEOUT_SECONDS,
     OPENAI_RETRY_ATTEMPTS,
@@ -324,7 +324,12 @@ TWEET TEXT:
 
 
 
-def gpt_is_duplicate(candidate_headline: str, tweet_text: str, recent_compressed_headlines: list[str]) -> bool:
+def gpt_is_duplicate(
+    candidate_headline: str,
+    tweet_text: str,
+    recent_compressed_headlines: list[str],
+    story_fp: StoryFingerprint | None = None,
+) -> bool:
     """
     Use GPT to decide if candidate_headline describes essentially the same story
     as any of the last N compressed headlines.
@@ -340,7 +345,7 @@ def gpt_is_duplicate(candidate_headline: str, tweet_text: str, recent_compressed
     if not recent_compressed_headlines:
         return False
 
-    candidate_fp = build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
+    candidate_fp = story_fp or build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
     if candidate_fp.is_recurring:
         # Scheduled macro/earnings/data releases often repeat the same entities,
         # verbs, and numbers across periods. Without period-aware stored history,

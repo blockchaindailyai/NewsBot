@@ -9,6 +9,7 @@ COMPRESSED_HEADLINES_FILE = "compressed_headlines.txt"  # compressed for dedupe
 
 _SEEN_HEADLINE_KEYS = set()       # normalized full headlines
 _SEEN_COMPRESSED_KEYS = set()     # normalized compressed headlines
+_COMPRESSED_HEADLINES: list[str] = []  # cached compressed headlines (avoids repeated disk scans)
 
 # NEW: locks to make dedupe thread-safe
 _FULL_LOCK = threading.Lock()
@@ -67,8 +68,9 @@ def load_headline_state() -> None:
                     if not line:
                         continue
                     key = normalize_headline_for_key(line)
-                    if key:
+                    if key and key not in _SEEN_COMPRESSED_KEYS:
                         _SEEN_COMPRESSED_KEYS.add(key)
+                        _COMPRESSED_HEADLINES.append(line)
         except Exception as e:
             print(f"[HEADLINE-WARN] Failed to load compressed headlines: {e}")
 
@@ -100,6 +102,7 @@ def _save_compressed_headline_if_new(headline: str) -> None:
         if key in _SEEN_COMPRESSED_KEYS:
             return
         _SEEN_COMPRESSED_KEYS.add(key)
+        _COMPRESSED_HEADLINES.append(compressed.strip())
         try:
             with open(COMPRESSED_HEADLINES_FILE, "a", encoding="utf-8") as f:
                 f.write(compressed.strip() + "\n")
@@ -167,16 +170,10 @@ def get_last_compressed_headlines(n: int = 100) -> list[str]:
 
 def get_all_compressed_headlines() -> list[str]:
     """
-    Return ALL non-empty compressed headlines from disk.
+    Return cached compressed headlines loaded at startup and updated on writes.
 
-    Used for full-history dedupe, where we then locally filter down
-    to the most relevant ones (e.g. by keyword overlap / Jaccard).
+    This avoids repeatedly scanning compressed_headlines.txt for every candidate,
+    which is important on low-CPU/low-I/O VPS deployments.
     """
-    lines: list[str] = []
-    try:
-        if os.path.exists(COMPRESSED_HEADLINES_FILE):
-            with open(COMPRESSED_HEADLINES_FILE, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-    except Exception as e:
-        print(f"[HEADLINE-WARN] Failed to read all compressed headlines: {e}")
-    return lines
+    with _COMPRESSED_LOCK:
+        return list(_COMPRESSED_HEADLINES)
