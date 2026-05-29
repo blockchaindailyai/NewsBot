@@ -2,8 +2,15 @@
 import re
 
 from headline_store import get_all_compressed_headlines
-
 from headline_compress import compress_headline_local
+from story_dedupe import StoryFingerprint, build_story_fingerprint
+
+
+_RECURRING_HISTORY_TERMS = {
+    "CPI", "PPI", "PCE", "NFP", "PAYROLL", "PAYROLLS", "JOBLESS", "CLAIMS",
+    "GDP", "ISM", "PMI", "RETAIL", "SALES", "UMICH", "INFLATION",
+    "UNEMPLOYMENT", "EARNINGS", "EPS", "REVENUE",
+}
 
 
 def _token_set(text: str) -> set[str]:
@@ -18,14 +25,35 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return inter / union if union else 0.0
 
 
-def is_local_duplicate(candidate_headline: str, threshold: float = 0.82) -> bool:
-    """
-    Compare candidate headline (COMPRESSED token set) to ALL COMPRESSED headlines
-    on disk. Returns True if any similarity >= threshold.
+def _is_recurring_candidate(
+    candidate_headline: str,
+    tweet_text: str = "",
+    story_fp: StoryFingerprint | None = None,
+) -> bool:
+    fp = story_fp or build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
+    return fp.is_recurring or bool(_token_set(candidate_headline) & _RECURRING_HISTORY_TERMS)
 
-    Full-history Jaccard means even day-old (or older) stories will still be
-    seen as duplicates if they are essentially the same headline.
+
+def is_local_duplicate(
+    candidate_headline: str,
+    threshold: float = 0.82,
+    *,
+    tweet_text: str = "",
+    allow_recurring_history: bool = False,
+    story_fp: StoryFingerprint | None = None,
+) -> bool:
     """
+    Compare a candidate headline against compressed headline history.
+
+    For recurring scheduled stories (CPI/PPI/PCE/NFP/GDP/jobless claims,
+    earnings, etc.), the function deliberately fails open by default. A May CPI
+    print can look nearly identical to an April CPI print, and those should both
+    be eligible to post unless an explicit period-aware duplicate layer proves
+    they are the same release.
+    """
+    if not allow_recurring_history and _is_recurring_candidate(candidate_headline, tweet_text, story_fp):
+        return False
+
     last = get_all_compressed_headlines()
     if not last:
         return False
@@ -41,4 +69,3 @@ def is_local_duplicate(candidate_headline: str, threshold: float = 0.82) -> bool
             return True
 
     return False
-

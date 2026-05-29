@@ -31,6 +31,13 @@ from signal_stats import (
     save_signal_stats,
     update_signal,   # <-- supports tweet_id kwarg
 )
+from story_dedupe import (
+    build_story_fingerprint,
+    likely_same_batch_story,
+    representative_score,
+)
+from story_registry import append_dedupe_audit, get_canonical_key
+
 from storage import (
     load_seen_ids,
     append_seen_id,
@@ -143,7 +150,7 @@ def input_listener():
             break
 
 
-def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue):
+def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=None, supporting_tweets=None):
     """
     Per-tweet analysis worker.
 
@@ -153,7 +160,13 @@ def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue):
     - If a new headline is found, enqueue it for the post_sender thread.
     """
     try:
-        analysis = analyze_tweet_importance(tweet_id, username, text)
+        analysis = analyze_tweet_importance(
+            tweet_id,
+            username,
+            text,
+            story_fp=story_fp,
+            supporting_tweets=supporting_tweets,
+        )
     except Exception as e:
         safe_print(f"[ERROR] Failed analyzing tweet {tweet_id}: {e!r}")
         return
@@ -377,6 +390,94 @@ def _trim_done_futures(futures: set[Future]):
     if done:
         futures.difference_update(done)
 
+
+
+
+def _prefilter_unique_stories_batch(tweets):
+    """
+    Group one scraped batch into likely-unique stories before GPT analysis.
+
+    CPU note: batches are small (~10-15 tweets), but this still uses direct key
+    indexes first and only falls back to pairwise similarity for ambiguous cases.
+    It returns the representative fingerprint so analysis does not rebuild it.
+    """
+    groups = []
+    key_to_group = {}
+
+    for tid, username, text in tweets:
+        try:
+            fingerprint = build_story_fingerprint(text)
+        except Exception as e:
+            safe_print(f"[DEDUP-WARN] Failed building story fingerprint for {tid}: {e!r}")
+            groups.append({
+                "items": [(tid, username, text, None)],
+                "representative": (tid, username, text, None),
+                "keys": set(),
+            })
+            continue
+
+        keys = set(fingerprint.batch_keys)
+        matched_group = None
+
+        for key in keys:
+            matched_group = key_to_group.get(key)
+            if matched_group is not None:
+                break
+
+        if matched_group is None:
+            for group in groups:
+                rep_fp = group["representative"][3]
+                if rep_fp is not None and likely_same_batch_story(fingerprint, rep_fp):
+                    matched_group = group
+                    break
+
+        item = (tid, username, text, fingerprint)
+        if matched_group is None:
+            group = {"items": [item], "representative": item, "keys": keys}
+            groups.append(group)
+            for key in keys:
+                key_to_group[key] = group
+            continue
+
+        matched_group["items"].append(item)
+        matched_group["keys"].update(keys)
+        for key in keys:
+            key_to_group[key] = matched_group
+
+        current = matched_group["representative"]
+        current_score = representative_score(current[1], current[2], current[3])
+        incoming_score = representative_score(username, text, fingerprint)
+        if incoming_score > current_score:
+            matched_group["representative"] = item
+
+    unique = []
+    for group in groups:
+        rep_tid, rep_username, rep_text, rep_fp = group["representative"]
+        supporting = [(tid, username) for tid, username, _, _ in group["items"]]
+        unique.append((rep_tid, rep_username, rep_text, rep_fp, supporting))
+
+        if len(group["items"]) > 1:
+            skipped = [tid for tid, _, _, _ in group["items"] if tid != rep_tid]
+            append_dedupe_audit(
+                "batch_duplicate_grouped",
+                kept_tweet_id=rep_tid,
+                kept_username=rep_username,
+                skipped_tweet_ids=skipped,
+                source_tweet_ids=[tid for tid, _ in supporting],
+                source_accounts=[username for _, username in supporting],
+                canonical_key=get_canonical_key(rep_fp) if rep_fp is not None else "",
+                is_recurring=bool(rep_fp and rep_fp.is_recurring),
+                period_key=(rep_fp.period_key if rep_fp is not None else ""),
+            )
+            if DEBUG_QUEUE_LOGS:
+                safe_print(
+                    f"[DEDUP-BATCH] Kept representative tweet {rep_tid}; "
+                    f"skipped same-batch duplicates: {', '.join(skipped)}"
+                )
+
+    return unique
+
+
 def run_bot():
     """
     Main bot session with threading:
@@ -456,6 +557,7 @@ def run_bot():
                 safe_print(f"[LOOP] Found {len(tweets)} tweets this cycle.")
                 consecutive_scrape_failures = 0
 
+                batch_candidates = []
                 for tid, username, text in tweets:
                     try:
                         if username and not username.startswith("@"):
@@ -465,10 +567,17 @@ def run_bot():
                             continue
 
                         update_signal(username, tweet_id=tid, seen=True)
-
                         seen_ids.add(tid)
                         append_seen_id(tid)
 
+                        batch_candidates.append((tid, username, text))
+                    except Exception as e:
+                        safe_print(f"[ERROR] Failed preparing tweet {tid}: {e!r}")
+
+                unique_candidates = _prefilter_unique_stories_batch(batch_candidates)
+
+                for tid, username, text, story_fp, supporting_tweets in unique_candidates:
+                    try:
                         _trim_done_futures(analysis_futures)
                         if len(analysis_futures) >= max(1, ANALYSIS_QUEUE_MAXSIZE):
                             safe_print(f"[ANALYSIS] Backpressure active; skipping tweet {tid} this cycle.")
@@ -480,6 +589,8 @@ def run_bot():
                             username,
                             text,
                             post_queue,
+                            story_fp,
+                            supporting_tweets,
                         )
                         fut.add_done_callback(_log_analysis_future_error)
                         analysis_futures.add(fut)

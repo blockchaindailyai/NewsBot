@@ -8,6 +8,7 @@ from typing import Optional
 
 from openai import OpenAI
 from headline_compress import compress_headline_local
+from story_dedupe import StoryFingerprint, build_story_fingerprint
 from config import (
     OPENAI_TIMEOUT_SECONDS,
     OPENAI_RETRY_ATTEMPTS,
@@ -323,7 +324,12 @@ TWEET TEXT:
 
 
 
-def gpt_is_duplicate(candidate_headline: str, tweet_text: str, recent_compressed_headlines: list[str]) -> bool:
+def gpt_is_duplicate(
+    candidate_headline: str,
+    tweet_text: str,
+    recent_compressed_headlines: list[str],
+    story_fp: StoryFingerprint | None = None,
+) -> bool:
     """
     Use GPT to decide if candidate_headline describes essentially the same story
     as any of the last N compressed headlines.
@@ -337,6 +343,14 @@ def gpt_is_duplicate(candidate_headline: str, tweet_text: str, recent_compressed
     if client is None:
         return False
     if not recent_compressed_headlines:
+        return False
+
+    candidate_fp = story_fp or build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
+    if candidate_fp.is_recurring:
+        # Scheduled macro/earnings/data releases often repeat the same entities,
+        # verbs, and numbers across periods. Without period-aware stored history,
+        # the safest high-recall behavior is to fail open and avoid suppressing
+        # a new important release (e.g. April CPI vs May CPI).
         return False
 
     compressed_candidate = compress_headline_local(candidate_headline)
@@ -387,6 +401,8 @@ def gpt_is_duplicate(candidate_headline: str, tweet_text: str, recent_compressed
         "(same entity + same action + same event), even if wording differs.\n"
         "If they are about different events, even with similar entities, treat them as NOT duplicates.\n\n"
         "DO NOT mark as duplicate comments from an event, such as an FOMC, Networking event, or earnings call unless you've seen essentially the same comment already.\n\n"
+        "DO NOT mark recurring scheduled data as duplicate unless the same release period/date is explicit in both items. "
+        "Examples: April CPI and May CPI are NOT duplicates, even if numbers are similar.\n\n"
         "DO NOT mark as duplicate large changes in share price (eg. a stock is down 5% then later it is down 10%, these are considered different stories)\n\n"
         "Respond with ONLY a single character:\n"
         "  '1' if the candidate IS a duplicate of any prior headline.\n"
