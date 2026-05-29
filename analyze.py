@@ -15,17 +15,15 @@ Flow summary:
      - If yes: treat as already-covered story, skip GPT, return no headline.
 
   3) IN-MEMORY STORY-LEVEL DEDUPE (pre-GPT, no tokens)
-     - Normalize the fallback headline to a key (strip 🚨#BREAKING, etc.).
-     - Maintain a per-process set of story keys.
+     - Claim high-precision local story keys produced by story_dedupe.py.
+     - Recurring data only contributes broad keys when the period/date is
+       explicit, preventing April-vs-May style false duplicates.
      - If key already claimed in this run: skip GPT entirely and return no headline.
-       This specifically catches the case where multiple accounts tweet
-       the same story in the same scrape cycle.
 
   4) OPTIONAL LOCAL NEAR-DUPE CHECK (pre-GPT, no tokens)
-     - Use Jaccard-based dedupe on the fallback headline vs the last 100
-       COMPRESSED headlines.
-     - If it's very similar to a recent story, treat it as already covered,
-       skip GPT and return no headline.
+     - Use Jaccard-based dedupe on compressed headlines for non-recurring
+       stories. Recurring scheduled data fails open to avoid suppressing
+       important new releases that resemble older periods.
 
   5) GPT IMPORTANCE SCORING (gpt-5-mini)
      - If scoring fails: fallback to importance_score=0, no headline.
@@ -64,11 +62,11 @@ from headline_store import (
     seen_full_preapi,
     save_full_headline,
     get_all_compressed_headlines,
-    normalize_headline_for_key,
 )
 
 from headline_dedupe import is_local_duplicate
 from local_headline_fallback import generate_blockchain_daily_headline
+from story_dedupe import build_story_fingerprint
 
 
 # ---------------------------- Fallback ---------------------------- #
@@ -89,37 +87,29 @@ def _fallback(tweet_id: str, reason: str) -> Dict[str, Any]:
 # Load existing headline state from disk (full + compressed).
 load_headline_state()
 
+
+
 # In-memory story-level dedupe (per process/run).
-# Uses normalized fallback headline keys to claim "this story slot".
 _STORY_KEYS: set[str] = set()
 _STORY_LOCK = threading.Lock()
 
 
-def _claim_story_slot_from_fallback(headline: str) -> bool:
+def _claim_story_slot(story_keys: tuple[str, ...]) -> bool:
     """
-    Try to claim a story slot based on the LOCAL fallback headline.
+    Claim one local story slot for this process.
 
-    Returns:
-        True  -> this story is NEW in this process/run (we claim it).
-        False -> we've already seen an essentially identical fallback headline
-                 in this process/run; caller should treat it as duplicate and
-                 skip GPT to save tokens.
-
-    Behavior notes:
-      - Uses normalize_headline_for_key() which strips alert prefixes,
-        uppercases, and removes non-alphanumerics.
-      - Only applies in-memory; disk-based dedupe is handled separately.
+    The keys are intentionally high precision. Recurring scheduled data only
+    contributes a broad story key when the period/date is explicit, which avoids
+    treating a new monthly release as a duplicate of an older similar release.
     """
-    key = normalize_headline_for_key(headline)
-    if not key:
-        # If something goes wrong with normalization, fail open and
-        # allow the story through rather than killing analysis.
+    keys = tuple(k for k in story_keys if k)
+    if not keys:
         return True
 
     with _STORY_LOCK:
-        if key in _STORY_KEYS:
+        if any(k in _STORY_KEYS for k in keys):
             return False
-        _STORY_KEYS.add(key)
+        _STORY_KEYS.update(keys)
         return True
 
 
@@ -144,15 +134,16 @@ def analyze_tweet_importance(tweet_id, username, text):
     """
     tweet_id_str = str(tweet_id)
 
-    # ---------- (1) Local fallback headline (no GPT) ---------- #
-    candidate_pre = generate_blockchain_daily_headline(text)
+    # ---------- (1) Local fallback headline + high-precision fingerprint (no GPT) ---------- #
+    story_fp = build_story_fingerprint(text)
+    candidate_pre = story_fp.fallback_headline or generate_blockchain_daily_headline(text)
 
     # ---------- (2) Disk-based exact dedupe (pre-GPT) ---------- #
-    # Check if the normalized fallback headline matches any stored
-    # full headline from previous runs. If yes, this is very likely
-    # the same core story -> skip GPT entirely.
+    # Recurring scheduled data is allowed through unless the period is explicit;
+    # otherwise this month's release can look identical to a much older release.
     try:
-        if seen_full_preapi(candidate_pre):
+        can_use_exact_history = (not story_fp.is_recurring) or bool(story_fp.period_key)
+        if can_use_exact_history and seen_full_preapi(candidate_pre):
             # Story already covered in prior runs.
             return {
                 "tweet_id": tweet_id_str,
@@ -166,12 +157,12 @@ def analyze_tweet_importance(tweet_id, username, text):
     # ---------- (3) In-memory story-level dedupe (pre-GPT) ---------- #
     # This specifically handles the case where multiple accounts post the
     # same story at about the same time in the same scrape cycle.
-    # Only the first thread to claim this fallback headline key will
+    # Only the first thread to claim this high-precision story key will
     # proceed to GPT. Others will bail out to save tokens.
     try:
-        claimed = _claim_story_slot_from_fallback(candidate_pre)
+        claimed = _claim_story_slot(story_fp.batch_keys)
     except Exception as e:
-        print(f"[DEDUP-WARN] _claim_story_slot_from_fallback failed for {tweet_id_str}: {e!r}")
+        print(f"[DEDUP-WARN] _claim_story_slot failed for {tweet_id_str}: {e!r}")
         claimed = True  # fail open
 
     if not claimed:
@@ -188,7 +179,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # very similar to a recent compressed headline on disk.
     # This saves tokens across runs when the same story keeps circulating.
     try:
-        if is_local_duplicate(candidate_pre, threshold=0.78):
+        if is_local_duplicate(candidate_pre, threshold=0.78, tweet_text=text):
             # Very similar to a recent story; we consider it already covered.
             return {
                 "tweet_id": tweet_id_str,
@@ -229,7 +220,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # ---------- (7) Post-GPT local near-dup (compressed Jaccard) ---------- #
     # Compare GPT headline against last 100 compressed headlines.
     try:
-        if is_local_duplicate(candidate, threshold=0.82):
+        if is_local_duplicate(candidate, threshold=0.82, tweet_text=text):
             return {
                 "tweet_id": tweet_id_str,
                 "importance_score": score,
@@ -257,7 +248,7 @@ def analyze_tweet_importance(tweet_id, username, text):
     # ---------- (9) Final save & return ---------- #
     # Save full headline (and compressed variant) if it's truly new.
     try:
-        if save_full_headline(candidate):
+        if save_full_headline(candidate, allow_duplicate_key=story_fp.is_recurring):
             return {
                 "tweet_id": tweet_id_str,
                 "importance_score": score,

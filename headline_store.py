@@ -107,10 +107,16 @@ def _save_compressed_headline_if_new(headline: str) -> None:
             print(f"[HEADLINE-WARN] Failed to write compressed headline: {e}")
 
 
-def save_full_headline(headline: str) -> bool:
+def save_full_headline(headline: str, *, allow_duplicate_key: bool = False) -> bool:
     """
     Save full headline to file if it's not in _SEEN_HEADLINE_KEYS (exact/normalized),
     and also persist a compressed version for deduping.
+
+    allow_duplicate_key is used for recurring scheduled data where the final
+    headline can be text-identical across different periods (e.g. April CPI vs
+    May CPI). In that case, the caller has already applied higher-level
+    same-run safeguards and chooses recall over suppressing a potentially new
+    important release.
 
     Returns True if written, False if duplicate.
     """
@@ -119,7 +125,7 @@ def save_full_headline(headline: str) -> bool:
         return False
 
     with _FULL_LOCK:
-        if key in _SEEN_HEADLINE_KEYS:
+        if key in _SEEN_HEADLINE_KEYS and not allow_duplicate_key:
             # Already seen in this process (or loaded from file).
             return False
 

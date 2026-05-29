@@ -31,6 +31,12 @@ from signal_stats import (
     save_signal_stats,
     update_signal,   # <-- supports tweet_id kwarg
 )
+from story_dedupe import (
+    build_story_fingerprint,
+    likely_same_batch_story,
+    representative_score,
+)
+
 from storage import (
     load_seen_ids,
     append_seen_id,
@@ -377,6 +383,68 @@ def _trim_done_futures(futures: set[Future]):
     if done:
         futures.difference_update(done)
 
+
+
+
+def _prefilter_unique_stories_batch(tweets):
+    """
+    Group one scraped batch into likely-unique stories before GPT analysis.
+
+    This stage is intentionally high precision and batch-local:
+      - It catches near-simultaneous duplicate posts from multiple accounts.
+      - It chooses the richest representative tweet from each duplicate group.
+      - It does NOT suppress recurring stories merely because older history looks
+        similar (for example April CPI vs May CPI). Historical dedupe remains in
+        analyze.py, where recurring-data safeguards are applied.
+    """
+    groups = []
+
+    for tid, username, text in tweets:
+        try:
+            fingerprint = build_story_fingerprint(text)
+        except Exception as e:
+            safe_print(f"[DEDUP-WARN] Failed building story fingerprint for {tid}: {e!r}")
+            groups.append({
+                "items": [(tid, username, text, None)],
+                "representative": (tid, username, text, None),
+            })
+            continue
+
+        matched_group = None
+        for group in groups:
+            rep_fp = group["representative"][3]
+            if rep_fp is not None and likely_same_batch_story(fingerprint, rep_fp):
+                matched_group = group
+                break
+
+        item = (tid, username, text, fingerprint)
+        if matched_group is None:
+            groups.append({"items": [item], "representative": item})
+            continue
+
+        matched_group["items"].append(item)
+
+        current = matched_group["representative"]
+        current_score = representative_score(current[1], current[2], current[3])
+        incoming_score = representative_score(username, text, fingerprint)
+        if incoming_score > current_score:
+            matched_group["representative"] = item
+
+    unique = []
+    for group in groups:
+        rep_tid, rep_username, rep_text, _ = group["representative"]
+        unique.append((rep_tid, rep_username, rep_text))
+
+        if DEBUG_QUEUE_LOGS and len(group["items"]) > 1:
+            skipped = [tid for tid, _, _, _ in group["items"] if tid != rep_tid]
+            safe_print(
+                f"[DEDUP-BATCH] Kept representative tweet {rep_tid}; "
+                f"skipped same-batch duplicates: {', '.join(skipped)}"
+            )
+
+    return unique
+
+
 def run_bot():
     """
     Main bot session with threading:
@@ -456,6 +524,7 @@ def run_bot():
                 safe_print(f"[LOOP] Found {len(tweets)} tweets this cycle.")
                 consecutive_scrape_failures = 0
 
+                batch_candidates = []
                 for tid, username, text in tweets:
                     try:
                         if username and not username.startswith("@"):
@@ -465,10 +534,17 @@ def run_bot():
                             continue
 
                         update_signal(username, tweet_id=tid, seen=True)
-
                         seen_ids.add(tid)
                         append_seen_id(tid)
 
+                        batch_candidates.append((tid, username, text))
+                    except Exception as e:
+                        safe_print(f"[ERROR] Failed preparing tweet {tid}: {e!r}")
+
+                unique_candidates = _prefilter_unique_stories_batch(batch_candidates)
+
+                for tid, username, text in unique_candidates:
+                    try:
                         _trim_done_futures(analysis_futures)
                         if len(analysis_futures) >= max(1, ANALYSIS_QUEUE_MAXSIZE):
                             safe_print(f"[ANALYSIS] Backpressure active; skipping tweet {tid} this cycle.")
