@@ -29,6 +29,14 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return set(default)
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or set(default)
+
+
 def _get_json_map(name: str) -> dict:
     raw = os.getenv(name)
     if not raw:
@@ -52,6 +60,17 @@ LOOP_SLEEP_SECONDS = _get_int("LOOP_SLEEP_SECONDS", 20)
 ACTIVE_LOOP_SLEEP_SECONDS = _get_int("ACTIVE_LOOP_SLEEP_SECONDS", 5)
 MAX_ANALYSIS_WORKERS = _get_int("MAX_ANALYSIS_WORKERS", 6)
 ANALYSIS_QUEUE_MAXSIZE = _get_int("ANALYSIS_QUEUE_MAXSIZE", 200)
+
+SCRAPER_AD_LABELS = _get_csv_set(
+    "SCRAPER_AD_LABELS",
+    {
+        "Ad",
+        "Promoted",
+        "Sponsored",
+        "광고",
+        "프로모션",
+    },
+)
 
 STORY_REGISTRY_PATH = os.getenv("STORY_REGISTRY_PATH", "story_registry.jsonl")
 DEDUPE_AUDIT_PATH = os.getenv("DEDUPE_AUDIT_PATH", "dedupe_audit.jsonl")
