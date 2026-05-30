@@ -38,6 +38,7 @@ _DEDUPE_ACTION_TERMS = {
     "FALL", "FALLS", "RISE", "RISES", "JUMP", "JUMPS", "DROP", "DROPS",
     "MINT", "MINTS", "BURN", "BURNS", "TRANSFER", "TRANSFERS",
     "OUTAGE", "DEPEG", "DEFAULT", "BANKRUPTCY", "INVEST", "INVESTS",
+    "SURGE", "SURGES", "SINK", "SINKS", "SLIDE", "SLIDES", "RALLY", "RALLIES",
 }
 
 
@@ -581,6 +582,12 @@ def gpt_is_duplicate(
         # verbs, and numbers across periods. Without period-aware stored history,
         # the safest high-recall behavior is to fail open and avoid suppressing
         # a new important release (e.g. April CPI vs May CPI).
+        return False
+    if candidate_fp.is_price_move:
+        # Asset price-move updates are intentionally high-recall. A later larger
+        # move in the same asset/direction can look text-similar to an older
+        # headline but is a distinct market update. Exact-save safeguards still
+        # catch literal repeats.
         return False
 
     compressed_candidate = compress_headline_local(candidate_headline)

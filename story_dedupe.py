@@ -55,6 +55,7 @@ _ACTION_NORMALIZATIONS = {
     "CUTS": "CUT", "HIKES": "HIKE",
     "BEATS": "BEAT", "MISSES": "MISS",
     "FALLS": "FALL", "RISES": "RISE", "JUMPS": "JUMP", "DROPS": "DROP",
+    "SURGES": "SURGE", "SINKS": "SINK", "SLIDES": "SLIDE", "RALLIES": "RALLY",
     "MINTS": "MINT", "BURNS": "BURN",
     "TRANSFERS": "TRANSFER",
 }
@@ -65,8 +66,22 @@ _ACTION_WORDS = {
     "EXPLOITED", "OUTAGE", "SUES", "SUE", "CHARGES", "CHARGE", "SETTLES",
     "SETTLE", "BUYS", "BUY", "SELLS", "SELL", "ACQUIRES", "ACQUIRE",
     "PARTNERS", "PARTNER", "RAISES", "RAISE", "CUTS", "CUT", "HIKES", "HIKE",
-    "BEATS", "MISSES", "MISS", "FALLS", "RISES", "JUMPS", "DROPS", "DOWN",
-    "UP", "MINTS", "MINT", "BURNS", "BURN", "TRANSFER", "TRANSFERS",
+    "BEATS", "MISSES", "MISS", "FALLS", "FALL", "RISES", "RISE", "JUMPS",
+    "JUMP", "DROPS", "DROP", "SURGES", "SURGE", "SINKS", "SINK", "SLIDES",
+    "SLIDE", "RALLIES", "RALLY", "DOWN", "UP", "MINTS", "MINT", "BURNS",
+    "BURN", "TRANSFER", "TRANSFERS",
+}
+
+_PRICE_MOVE_ACTIONS = {
+    "UP", "DOWN", "RISE", "RISES", "FALL", "FALLS", "JUMP", "JUMPS",
+    "DROP", "DROPS", "SURGE", "SURGES", "SINK", "SINKS", "SLIDE", "SLIDES",
+    "RALLY", "RALLIES", "GAIN", "GAINS", "LOSE", "LOSES", "PLUNGE", "PLUNGES",
+}
+
+_PRICE_MOVE_MARKET_TERMS = {
+    "SHARES", "STOCK", "STOCKS", "TOKEN", "TOKENS", "COIN", "COINS", "CRYPTO",
+    "BTC", "BITCOIN", "ETH", "ETHEREUM", "SOL", "XRP", "DOGE", "BNB", "ADA",
+    "AVAX", "TRX", "ZEC", "LTC", "LINK", "SUI", "HYPE",
 }
 
 
@@ -77,6 +92,7 @@ class StoryFingerprint:
     entity_action_key: str
     token_set: frozenset[str]
     is_recurring: bool
+    is_price_move: bool
     period_key: str
 
     @property
@@ -85,7 +101,7 @@ class StoryFingerprint:
         keys: list[str] = []
         if self.exact_key:
             keys.append(f"exact:{self.exact_key}")
-        if self.entity_action_key:
+        if self.entity_action_key and not self.is_price_move:
             if self.is_recurring:
                 # Recurring data can be deduped locally only when the release
                 # period/date is explicit. Otherwise, fail open to avoid hiding
@@ -149,12 +165,33 @@ def _entity_action_key(tokens: list[str]) -> str:
     return " ".join(important)
 
 
+def _is_asset_price_move(raw_text: str, tokens: list[str], is_recurring: bool) -> bool:
+    """
+    Identify market tape-style asset price moves.
+
+    These stories often share only an asset and a direction (for example BTC down
+    5%, then BTC down 8%). Treating that broad shape as a duplicate hides fresh
+    market moves, so only exact-headline safeguards should suppress them.
+    """
+    if is_recurring:
+        return False
+
+    token_set = set(tokens)
+    has_move = bool(token_set & _PRICE_MOVE_ACTIONS)
+    has_percent = any(re.fullmatch(r"\d+(?:\.\d+)?%", tok) for tok in tokens)
+    has_market_term = bool(token_set & _PRICE_MOVE_MARKET_TERMS)
+    has_cash_ticker = bool(re.search(r"\$[A-Z]{1,6}\b", raw_text or ""))
+
+    return has_move and has_percent and (has_market_term or has_cash_ticker)
+
+
 def build_story_fingerprint(text: str) -> StoryFingerprint:
     fallback = generate_blockchain_daily_headline(text)
     exact_key = normalize_headline_for_key(fallback)
     tokens = story_tokens(text or fallback)
     token_set = frozenset(tokens)
     is_recurring = bool(token_set & _RECURRING_TERMS)
+    is_price_move = _is_asset_price_move(text or fallback, tokens, is_recurring)
     period_key = _extract_period_key(tokens)
     return StoryFingerprint(
         fallback_headline=fallback,
@@ -162,6 +199,7 @@ def build_story_fingerprint(text: str) -> StoryFingerprint:
         entity_action_key=_entity_action_key(tokens),
         token_set=token_set,
         is_recurring=is_recurring,
+        is_price_move=is_price_move,
         period_key=period_key,
     )
 
@@ -176,6 +214,11 @@ def likely_same_batch_story(a: StoryFingerprint, b: StoryFingerprint) -> bool:
     """High-precision same-batch duplicate check."""
     if set(a.batch_keys) & set(b.batch_keys):
         return True
+
+    if a.is_price_move or b.is_price_move:
+        # Price moves need exact-key equality to dedupe; same asset/direction with
+        # a changed magnitude is a fresh market update.
+        return False
 
     if a.is_recurring or b.is_recurring:
         # For recurring data, only same explicit period can be auto-merged.

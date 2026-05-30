@@ -33,6 +33,23 @@ class StoryDedupeTests(unittest.TestCase):
             )
         )
 
+    def test_asset_price_moves_are_not_broad_batch_duplicates(self):
+        first = build_story_fingerprint("$BTC drops 5% as liquidations accelerate")
+        second = build_story_fingerprint("$BTC drops 8% as liquidations accelerate")
+
+        self.assertTrue(first.is_price_move)
+        self.assertTrue(second.is_price_move)
+        self.assertFalse(likely_same_batch_story(first, second))
+
+    def test_asset_price_move_history_dedupe_fails_open(self):
+        self.assertFalse(
+            is_local_duplicate(
+                "🚨 $BTC DROPS 8% AS LIQUIDATIONS ACCELERATE",
+                threshold=0.1,
+                tweet_text="$BTC drops 8% as liquidations accelerate",
+            )
+        )
+
     def test_official_account_gets_trust_boost(self):
         self.assertGreater(account_trust_score("@SECGov"), account_trust_score("@unknown"))
 

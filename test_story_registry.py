@@ -41,6 +41,21 @@ class StoryRegistryTests(unittest.TestCase):
         self.assertTrue(story_registry.has_historical_duplicate(april))
         self.assertFalse(story_registry.has_historical_duplicate(may))
 
+    def test_price_move_registry_does_not_block_later_larger_move(self):
+        first = build_story_fingerprint("$BTC drops 5% as liquidations accelerate")
+        second = build_story_fingerprint("$BTC drops 8% as liquidations accelerate")
+
+        story_registry.save_story_record(
+            headline="🚨 $BTC DROPS 5% AS LIQUIDATIONS ACCELERATE",
+            fingerprint=first,
+            tweet_id="1",
+            username="@market",
+        )
+
+        self.assertTrue(first.is_price_move)
+        self.assertTrue(second.is_price_move)
+        self.assertFalse(story_registry.has_historical_duplicate(second))
+
     def test_audit_log_persists_event(self):
         story_registry.append_dedupe_audit("batch_duplicate_grouped", kept_tweet_id="1")
         self.assertIn("batch_duplicate_grouped", self.audit_path.read_text(encoding="utf-8"))

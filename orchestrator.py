@@ -175,6 +175,7 @@ def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=N
     label = analysis.get("label", "low")
     reason = analysis.get("reason", "")
     headline = analysis.get("headline")
+    suppressed_headline = analysis.get("suppressed_headline")
 
     label_char = label[0].upper() if label else "L"
     imp = f"{score}{label_char}"
@@ -195,6 +196,11 @@ def analyze_tweet_worker(tweet_id, username, text, post_queue: Queue, story_fp=N
 
     if headline:
         lines.append(f"[HEADLINE] {headline}")
+    elif suppressed_headline:
+        short_candidate = str(suppressed_headline).replace("\n", " ")
+        if len(short_candidate) > 220:
+            short_candidate = short_candidate[:217] + "..."
+        lines.append(f"[DUPLICATE-CANDIDATE] {short_candidate}")
 
     block = "\n".join(lines)
     safe_print(block)
