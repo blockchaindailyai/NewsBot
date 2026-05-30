@@ -49,9 +49,14 @@ def is_local_duplicate(
     earnings, etc.), the function deliberately fails open by default. A May CPI
     print can look nearly identical to an April CPI print, and those should both
     be eligible to post unless an explicit period-aware duplicate layer proves
-    they are the same release.
+    they are the same release. Asset price moves also fail open because BTC down
+    5% and BTC down 8% are different market updates even though their compressed
+    headlines can be highly similar.
     """
-    if not allow_recurring_history and _is_recurring_candidate(candidate_headline, tweet_text, story_fp):
+    fp = story_fp or build_story_fingerprint(f"{candidate_headline}\n{tweet_text}")
+    if fp.is_price_move:
+        return False
+    if not allow_recurring_history and _is_recurring_candidate(candidate_headline, tweet_text, fp):
         return False
 
     last = get_all_compressed_headlines()

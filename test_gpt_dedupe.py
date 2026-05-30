@@ -53,6 +53,20 @@ class GptDedupePromptTests(unittest.TestCase):
         self.assertNotIn("Full tweet text for context", user_prompt)
         self.assertNotIn("extra detail extra detail extra detail", user_prompt)
 
+    def test_gpt_dedupe_fails_open_for_asset_price_moves(self):
+        with patch.object(gpt_client, "client", object()), patch.object(
+            gpt_client, "_chat_completion_with_retry"
+        ) as completion:
+            self.assertFalse(
+                gpt_client.gpt_is_duplicate(
+                    "🚨 $BTC DROPS 8% AS LIQUIDATIONS ACCELERATE",
+                    "$BTC drops 8% as liquidations accelerate",
+                    ["BTC DROPS 5% AS LIQUIDATIONS ACCELERATE"],
+                )
+            )
+
+        completion.assert_not_called()
+
     def test_dedupe_prompt_includes_capped_excerpt_for_sparse_candidate(self):
         captured = {}
 

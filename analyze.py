@@ -78,6 +78,36 @@ from story_registry import (
 # ---------------------------- Fallback ---------------------------- #
 
 
+def _duplicate_result(
+    tweet_id: str,
+    score: int,
+    label: str,
+    *,
+    source: str,
+    stage: str,
+    candidate_headline: str | None = None,
+) -> Dict[str, Any]:
+    """Return a no-post result that explains duplicate suppression."""
+    source_label = "gpt dedupe" if source == "gpt" else "local dedupe"
+    if source == "gpt":
+        reason = "Duplicate skipped after publish analysis: gpt dedupe."
+    else:
+        reason = f"Duplicate skipped by {source_label}: {stage}."
+
+    result: Dict[str, Any] = {
+        "tweet_id": str(tweet_id),
+        "importance_score": int(score),
+        "label": label,
+        "headline": None,
+        "reason": reason,
+        "dedupe_source": source_label,
+        "dedupe_stage": stage,
+    }
+    if candidate_headline:
+        result["suppressed_headline"] = candidate_headline
+    return result
+
+
 def _fallback(tweet_id: str, reason: str) -> Dict[str, Any]:
     # 'reason' kept only for internal debugging if needed
     return {
@@ -260,12 +290,14 @@ def analyze_tweet_importance(
                 is_recurring=story_fp.is_recurring,
                 period_key=story_fp.period_key,
             )
-            return {
-                "tweet_id": tweet_id_str,
-                "importance_score": 0,
-                "label": "low",
-                "headline": None,
-            }
+            return _duplicate_result(
+                tweet_id_str,
+                0,
+                "low",
+                source="local",
+                stage="historical duplicate before GPT analysis",
+                candidate_headline=candidate_pre,
+            )
     except Exception as e:
         print(f"[DEDUP-WARN] seen_full_preapi failed for {tweet_id_str}: {e!r}")
 
@@ -282,12 +314,14 @@ def analyze_tweet_importance(
 
     if not claimed:
         # Story already claimed this run; treat as duplicate and skip GPT.
-        return {
-            "tweet_id": tweet_id_str,
-            "importance_score": 0,
-            "label": "low",
-            "headline": None,
-        }
+        return _duplicate_result(
+            tweet_id_str,
+            0,
+            "low",
+            source="local",
+            stage="same-run story already claimed before GPT analysis",
+            candidate_headline=candidate_pre,
+        )
 
     # ---------- (4) Optional pre-GPT near-dup vs recent compressed ---------- #
     # Extra safeguard to skip GPT if this fallback headline is already
@@ -296,12 +330,14 @@ def analyze_tweet_importance(
     try:
         if is_local_duplicate(candidate_pre, threshold=0.78, tweet_text=text, story_fp=story_fp):
             # Very similar to a recent story; we consider it already covered.
-            return {
-                "tweet_id": tweet_id_str,
-                "importance_score": 0,
-                "label": "low",
-                "headline": None,
-            }
+            return _duplicate_result(
+                tweet_id_str,
+                0,
+                "low",
+                source="local",
+                stage="pre-GPT near-duplicate headline history check",
+                candidate_headline=candidate_pre,
+            )
     except Exception as e:
         print(f"[DEDUP-WARN] Pre-GPT near-dup check failed for {tweet_id_str}: {e!r}")
         # Fail open: if this check explodes, better to continue than crash.
@@ -339,12 +375,14 @@ def analyze_tweet_importance(
     # Compare GPT headline against last 100 compressed headlines.
     try:
         if is_local_duplicate(candidate, threshold=0.82, tweet_text=text, story_fp=story_fp):
-            return {
-                "tweet_id": tweet_id_str,
-                "importance_score": score,
-                "label": label,
-                "headline": None,
-            }
+            return _duplicate_result(
+                tweet_id_str,
+                score,
+                label,
+                source="local",
+                stage="post-GPT near-duplicate headline history check",
+                candidate_headline=candidate,
+            )
     except Exception as e:
         print(f"[DEDUP-WARN] Post-GPT local dedupe failed for {tweet_id_str}: {e!r}")
 
@@ -354,12 +392,14 @@ def analyze_tweet_importance(
     recent_compressed = get_all_compressed_headlines()
     try:
         if gpt_is_duplicate(candidate, text, recent_compressed, story_fp=story_fp):
-            return {
-                "tweet_id": tweet_id_str,
-                "importance_score": score,
-                "label": label,
-                "headline": None,
-            }
+            return _duplicate_result(
+                tweet_id_str,
+                score,
+                label,
+                source="gpt",
+                stage="GPT duplicate adjudication",
+                candidate_headline=candidate,
+            )
     except Exception as e:
         print(f"[DEDUP-WARN] gpt_is_duplicate failed for {tweet_id_str}: {e!r}")
 
@@ -383,12 +423,14 @@ def analyze_tweet_importance(
             }
         else:
             # Exact normalized duplicate at save time (race or pre-existing).
-            return {
-                "tweet_id": tweet_id_str,
-                "importance_score": score,
-                "label": label,
-                "headline": None,
-            }
+            return _duplicate_result(
+                tweet_id_str,
+                score,
+                label,
+                source="local",
+                stage="final exact headline save check",
+                candidate_headline=candidate,
+            )
     except Exception as e:
         print(f"[HEADLINE-ERROR] Failed to save headline for {tweet_id_str}: {e!r}")
         # If saving fails, better to return no headline than risk repeating later.

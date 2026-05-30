@@ -62,7 +62,7 @@ def _recurring_key(fp: StoryFingerprint) -> str:
 
 
 def _story_key(fp: StoryFingerprint) -> str:
-    if fp.is_recurring or not fp.entity_action_key:
+    if fp.is_recurring or fp.is_price_move or not fp.entity_action_key:
         return ""
     return f"story:{fp.entity_action_key}"
 
@@ -126,7 +126,10 @@ def has_historical_duplicate(fp: StoryFingerprint) -> bool:
     Recurring stories require an explicit period key, so April-vs-May style
     stories do not collide. Non-recurring broad story keys are checked only in a
     recent time window to avoid suppressing a genuinely new outage/exploit/etc.
-    much later. Exact headline keys remain global for non-recurring stories.
+    much later. Asset price moves deliberately do not use broad story keys,
+    because a later larger move in the same asset/direction is a new market
+    update, not a duplicate. Exact headline keys remain global for non-recurring
+    stories.
     """
     load_story_registry()
     recurring_key = _recurring_key(fp)
@@ -177,6 +180,7 @@ def save_story_record(
         "canonical_key": _canonical_key(fingerprint),
         "entity_action_key": fingerprint.entity_action_key,
         "is_recurring": fingerprint.is_recurring,
+        "is_price_move": fingerprint.is_price_move,
         "period_key": fingerprint.period_key,
         "tokens": sorted(fingerprint.token_set),
         "source_tweet_ids": source_tweet_ids or [str(tweet_id)],
