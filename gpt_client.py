@@ -191,13 +191,77 @@ Return ONLY one of these compact formats:
 
 DEFAULT = 0. Only a small minority of tweets should ever be 1.
 
-Publish only when the tweet clearly describes a concrete, market-relevant event involving at least one of:
-- major crypto assets/tickers, exchanges, issuers, regulators, or well-known crypto companies
-- US macro data/policy (CPI, PPI, PCE, NFP, GDP, jobless claims, Fed/FOMC/Treasury, rates, tariffs)
-- major US megacap equities or clearly market-moving finance events
-- major geopolitical escalations that are truly market moving
+A tweet must pass BOTH TESTS:
 
-Always publish 0 for routine commentary, memes, vague opinions, promos, Spaces/AMAs/watch-live posts with no substance, stale/ICYMI resharing, non-US routine data, and price chatter without a concrete percent/move/event.
+====================================================
+TEST 1 — RELEVANT ENTITY REQUIRED
+Tweet MUST explicitly mention at least ONE of:
+
+- A major cryptocurrency or ticker (BTC, ETH, SOL, TRX, XRP, etc.)
+- A major crypto exchange, issuer, regulator, or well-known crypto company
+- A major US macro term (CPI, PPI, PCE, NFP, GDP, JOBLESS CLAIMS, RETAIL SALES, FED, FOMC, TREASURY, etc.)
+- A major US megacap equity (AAPL, MSFT, AMZN, NVDA, META, TSLA, GOOGL, etc.)
+- A major US government figure (President, Treasury Sec, Fed Chair/Governors)
+
+If NONE of these appear → return 0.
+
+Non-US companies, non-US politicians, and non-US economic data DO NOT COUNT unless the event is massively market-moving (see TEST 2).
+
+====================================================
+TEST 2 — SPECIFIC MARKET-MOVING EVENT REQUIRED
+Tweet MUST clearly describe a real event such as:
+
+CRYPTO:
+- exchange outages, halts, hacks, exploits
+- chain outages, upgrades, halts
+- stablecoin depegs or ≥$100M mints/burns
+- major lawsuits/regulation/enforcement involving crypto
+- >4% major crypto price moves
+- ETF flows (spot only)
+- >$500M on-chain transfers for BTC or USDT
+- >$250M on-chain transfers for anything else
+- On-chain trades (longs/shorts) >$100M
+- Long/short liquidations >$250M
+- Famous/popular/well-known/influential investor's trades
+- big corporate filings about crypto, treasury buys, or sales
+- major governance/DAO changes
+
+US MACRO:
+- CPI/PPI/PCE/NFP/UMICH/ISM/GDP coming in as data
+- big beats/misses
+- Fed rate changes, major Fed comments, policy signals
+- Treasury/White House comments on inflation, tariffs, rates
+- major consumer or housing reports
+
+MEGACAP / FINANCE:
+- earnings beat/miss
+- major CEO/CFO changes
+- major partnership, major crypto involvement
+- bankruptcy, default, major financing crisis
+- major stock move >5%
+
+GEOPOLITICAL (ONLY IF TRULY MARKET-MOVING):
+- major new war declarations
+- major attacks or escalations involving US, EU, China, Japan
+- major peace deals
+Routine Ukraine/Israel/Middle East updates = ALWAYS 0.
+
+====================================================
+ALWAYS 0 (DO NOT PUBLISH):
+- Anything routine from non-US economies (China, EU, Korea, Japan, India, UK, etc.)
+- Non-US inflation, GDP, PMIs, trade data (unless extremely shocking AND explicitly stated)
+- Routine political statements without market impact
+- General commentary, opinions, memes, hype, promos, Spaces, AMAs
+- Vague statements without data/action
+- Old stories, ICYMI, re-shares
+- Any tweet under 5 words unless it contains a ticker + a clear event
+- Price changes without % (e.g., "BTC up")
+- Non-crypto tech news unless it involves megacaps AND is clearly material
+- Routine filings, earnings, reports, product announcements, or statements from any non-crypto corporations
+
+====================================================
+WHEN IN DOUBT:
+If the tweet is not concrete, not US-macro, not major-crypto, or not definitely market-moving → return 0.
 
 If returning 1, headline rules:
 - Prefix with exactly one 🚨.
